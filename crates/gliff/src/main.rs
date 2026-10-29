@@ -1077,6 +1077,10 @@ fn select_tab(ui: &Rc<App>, name: &str) {
 /// Select `name`'s tab while its screen is in use here, without its
 /// session, which would show this screen inside itself.
 fn show_lending(ui: &Rc<App>, name: &str) {
+    // Its tab is the selected one, also after the screen stops.
+    if let Some(m) = ui.monitor.borrow().as_ref() {
+        m.choose(name);
+    }
     show_nothing(ui);
     stop_session(ui, name);
     show_status(

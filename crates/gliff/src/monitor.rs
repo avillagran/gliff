@@ -129,6 +129,11 @@ impl Controller {
         crate::tab_names(&ui).contains(&name).then_some(name)
     }
 
+    /// `name`'s tab is selected without its session shown.
+    pub fn choose(&self, name: &str) {
+        *self.chosen.borrow_mut() = Some(name.to_owned());
+    }
+
     /// Another machine is shown: its tab is the selected one now.
     pub fn unchoose(&self) {
         self.chosen.borrow_mut().take();
@@ -260,7 +265,6 @@ impl Controller {
         }
         // Showing that machine here while it shows this screen would put
         // the screen inside itself. Its tab stays selected, not the next one.
-        *self.chosen.borrow_mut() = Some(name.clone());
         crate::show_lending(&ui, &name);
         let target = Target {
             host: name.clone(),
