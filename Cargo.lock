@@ -963,6 +963,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "hypr-edge"
+version = "0.4.1"
+dependencies = [
+ "calloop",
+ "hypr-ipc",
+ "hypr-wl",
+ "nix",
+ "thiserror",
+ "tracing",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
+]
+
+[[package]]
 name = "hypr-input"
 version = "0.4.1"
 dependencies = [
