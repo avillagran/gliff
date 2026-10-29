@@ -759,6 +759,7 @@ dependencies = [
  "gliff-transport",
  "gliff-vk",
  "hypr-capture",
+ "hypr-edge",
  "hypr-input",
  "hypr-ipc",
  "hypr-wl",
