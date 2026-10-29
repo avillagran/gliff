@@ -1620,6 +1620,9 @@ struct SessionOutput {
     scale: f32,
     /// Where a headless output is kept among the other screens.
     placement: Option<Placement>,
+    /// The placement is left to Hyprland's own `auto-*` positions, because
+    /// a fixed one moved the screens that Hyprland places automatically.
+    relative: bool,
     headless: Option<hypr_ipc::Instance>,
     awake: Option<KeepAwake>,
 }
@@ -1641,6 +1644,9 @@ impl SessionOutput {
         let Some(placement) = self.placement else {
             return "auto".into();
         };
+        if self.relative {
+            return placement.relative().into();
+        }
         let others: Vec<Screen> = match instance.monitors() {
             Ok(mons) => mons
                 .iter()
@@ -1797,6 +1803,33 @@ impl Placement {
             Edge::Below => (along(left, right, width), bottom),
         }
     }
+
+    /// The same placement in Hyprland's `auto-*` positions, which keep the
+    /// screens Hyprland places automatically where they were. They line up
+    /// at the start or the center only; the end becomes the center.
+    fn relative(self) -> &'static str {
+        match (self.side, self.align == Align::Start) {
+            (Edge::Right, true) => "auto-right",
+            (Edge::Right, false) => "auto-center-right",
+            (Edge::Left, true) => "auto-left",
+            (Edge::Left, false) => "auto-center-left",
+            (Edge::Above, true) => "auto-up",
+            (Edge::Above, false) => "auto-center-up",
+            (Edge::Below, true) => "auto-down",
+            (Edge::Below, false) => "auto-center-down",
+        }
+    }
+}
+
+/// Where each other screen is, to tell whether placing an output moved one.
+fn other_positions(mons: &[hypr_ipc::Monitor], name: &str) -> Vec<(String, i32, i32)> {
+    let mut v: Vec<_> = mons
+        .iter()
+        .filter(|m| m.name != name)
+        .map(|m| (m.name.clone(), m.x, m.y))
+        .collect();
+    v.sort();
+    v
 }
 
 /// Pick the named output, or create a headless one sized to the client.
@@ -1827,6 +1860,7 @@ fn setup_output(
             } & !1,
             scale: m.scale,
             placement: None,
+            relative: false,
             headless: None,
             awake: None,
         });
@@ -1848,6 +1882,7 @@ fn setup_output(
         height: 0,
         scale: 1.0,
         placement: cfg.placement,
+        relative: false,
         headless: Some(instance.clone()),
         awake: None,
     };
@@ -1865,31 +1900,54 @@ fn setup_output(
     })?;
     let width = caps.max_width.clamp(320, 1920) & !1;
     let height = caps.max_height.clamp(240, 1080) & !1;
-    if let Err(e) = instance.set_monitor_rule(
-        &output.name,
-        width,
-        height,
-        60,
-        &output.position(instance, width, height, 1.0),
-        1.0,
-    ) {
-        tracing::warn!(error = %e, "could not set the headless output mode");
-    }
-    // Hyprland applies the mode asynchronously; stream whatever it settled
-    // on rather than the size we asked for.
-    let mut applied = None;
-    for _ in 0..10 {
-        std::thread::sleep(Duration::from_millis(50));
-        let mons = instance.monitors()?;
-        let Some(m) = mons.iter().find(|m| m.name == output.name) else {
-            continue;
-        };
-        applied = Some((m.width, m.height, m.scale));
-        if m.width == width && m.height == height {
-            break;
+    let apply = |output: &SessionOutput| -> Result<(u32, u32, f32)> {
+        if let Err(e) = instance.set_monitor_rule(
+            &output.name,
+            width,
+            height,
+            60,
+            &output.position(instance, width, height, 1.0),
+            1.0,
+        ) {
+            tracing::warn!(error = %e, "could not set the headless output mode");
+        }
+        // Hyprland applies the mode asynchronously; stream whatever it
+        // settled on rather than the size we asked for.
+        let mut applied = None;
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(50));
+            let mons = instance.monitors()?;
+            let Some(m) = mons.iter().find(|m| m.name == output.name) else {
+                continue;
+            };
+            applied = Some((m.width, m.height, m.scale));
+            if m.width == width && m.height == height {
+                break;
+            }
+        }
+        applied.context("headless output vanished")
+    };
+    let before = other_positions(&instance.monitors()?, &output.name);
+    let mut mode = apply(&output)?;
+    // Hyprland places a screen whose position is `auto` after every fixed
+    // one, so a fixed position for this output moves it. Leave the
+    // placement to Hyprland then.
+    if let Some(placement) = output.placement {
+        if other_positions(&instance.monitors()?, &output.name) != before {
+            if placement.align == Align::End {
+                tracing::warn!(
+                    "other screens are placed automatically, so the output is centered on that side"
+                );
+            }
+            tracing::info!(
+                position = placement.relative(),
+                "other screens moved; placing relative to them"
+            );
+            output.relative = true;
+            mode = apply(&output)?;
         }
     }
-    let (w, h, scale) = applied.context("headless output vanished")?;
+    let (w, h, scale) = mode;
     output.width = w & !1;
     output.height = h & !1;
     output.scale = scale;
@@ -2158,6 +2216,18 @@ mod tests {
             align: Align::Start,
         };
         assert_eq!(alone.position(&[], (800, 600)), (0, 0));
+    }
+
+    #[test]
+    fn relative_placement_uses_hyprland_auto_positions() {
+        let p = |side, align| Placement { side, align }.relative();
+        assert_eq!(p(Edge::Right, Align::Start), "auto-right");
+        assert_eq!(p(Edge::Right, Align::Center), "auto-center-right");
+        // Hyprland has no position for the end of a side.
+        assert_eq!(p(Edge::Right, Align::End), "auto-center-right");
+        assert_eq!(p(Edge::Left, Align::Start), "auto-left");
+        assert_eq!(p(Edge::Above, Align::Center), "auto-center-up");
+        assert_eq!(p(Edge::Below, Align::Start), "auto-down");
     }
 
     #[test]
