@@ -45,6 +45,11 @@ const MAX_ZOOMED_PIXELS: u64 = 7680 * 4320;
 const MAX_ZOOMED_SIDE: u32 = 8192;
 // Matches the cursor size the UI accepts (`remote_cursor`).
 const MAX_CURSOR: u32 = 1024;
+/// GPU decode errors in a row, before the GPU has decoded any picture, after
+/// which the session decodes on the CPU instead. Some drivers (NVIDIA's
+/// VA-API on NVDEC) list an H.264 decoder that cannot hand its pictures over,
+/// so every frame fails and the screen stays black.
+const GPU_FAILURES_BEFORE_CPU: u32 = 3;
 
 /// A decoded frame with the geometry it was configured under, so the UI
 /// never paints a frame with another configuration's view or scale (frames
@@ -522,7 +527,7 @@ where
     let mut reader = Framed::new(rd);
     let mut writer = Framed::new(wr);
 
-    let gpu = open_gpu(video);
+    let mut gpu = open_gpu(video);
     let caps = ClientCaps {
         codecs: vec![Codec::H264],
         max_width: MAX_STREAM.0,
@@ -603,6 +608,7 @@ where
         }
     };
     let mut decoder = new_decoder(&gpu, cfg.chroma, cfg.stream.0, cfg.stream.1)?;
+    let mut pipeline = pipeline;
     let mut video_label = tier_label(pipeline, &decoder);
     let _ = status.send(Status::Connected {
         video: video_label.clone(),
@@ -618,6 +624,12 @@ where
     let ((width, height), scale_milli) = (cfg.stream, cfg.scale_milli);
     tracing::info!(width, height, scale_milli, decode_on, video = %video_label, "connected");
     let mut logged_first = false;
+    // GPU decode errors since the session started, while the GPU has
+    // decoded nothing yet; `None` once it has, which proves it works.
+    let mut gpu_failures = Some(0);
+    // Set when the decoder was replaced mid-stream: frames that depend on
+    // pictures it never saw are skipped until the keyframe asked for.
+    let mut await_keyframe = false;
 
     // Writes run on their own task, fed by `out_tx`, so reads (draining video)
     // never block on a write and the two peers cannot deadlock. Both the reader
@@ -824,7 +836,7 @@ where
         match msg {
             ServerMsg::VideoFrame {
                 frame_id,
-                keyframe: _,
+                keyframe,
                 data_len,
                 aux_len,
                 ..
@@ -837,6 +849,17 @@ where
                 };
                 bytes_since += (data_len + aux_len) as u64;
                 drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
+                if await_keyframe && !keyframe {
+                    let _ = out_tx.send((
+                        ClientMsg::FrameAck {
+                            frame_id,
+                            decoded_at_ms: now_ms(),
+                        },
+                        Bytes::new(),
+                    ));
+                    continue;
+                }
+                await_keyframe = false;
                 in_decoder.push_back(cfg.geometry());
                 let t0 = std::time::Instant::now();
                 let decoded = match &mut decoder {
@@ -867,6 +890,9 @@ where
                         if !logged_first {
                             tracing::info!("first frame decoded");
                             logged_first = true;
+                        }
+                        if matches!(frame, Frame::Dmabuf(_)) {
+                            gpu_failures = None;
                         }
                         // Latest-wins: a frame the full UI channel rejects
                         // waits in `undelivered` (superseding any drained
@@ -909,6 +935,31 @@ where
                         tracing::warn!(error = %e, "decode error; requesting keyframe");
                         in_decoder.clear();
                         let _ = out_tx.send((ClientMsg::RequestKeyframe, Bytes::new()));
+                        if matches!(decoder, VideoDecoder::Gpu(_)) {
+                            if let Some(n) = gpu_failures.as_mut() {
+                                *n += 1;
+                                if *n >= GPU_FAILURES_BEFORE_CPU {
+                                    tracing::warn!(
+                                        failures = *n,
+                                        "the GPU decodes no frame; falling back to the CPU pipeline"
+                                    );
+                                    gpu = None;
+                                    let (width, height) = cfg.stream;
+                                    decoder = new_decoder(&gpu, cfg.chroma, width, height)?;
+                                    last_gpu_geometry = None;
+                                    undelivered = None;
+                                    await_keyframe = true;
+                                    video_label = tier_label(pipeline, &decoder);
+                                    let _ = status.send(Status::Connected {
+                                        video: video_label.clone(),
+                                        view_width: cfg.view.0,
+                                        view_height: cfg.view.1,
+                                        fps_cap: cfg.fps_cap,
+                                        headless,
+                                    });
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -917,12 +968,13 @@ where
                 height,
                 chroma,
                 scale_milli,
-                pipeline,
+                pipeline: next_pipeline,
                 view_width,
                 view_height,
                 fps_cap,
                 ..
             } => {
+                pipeline = next_pipeline;
                 let next = Config::new(
                     (width, height),
                     chroma,
