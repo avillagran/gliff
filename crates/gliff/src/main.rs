@@ -155,6 +155,9 @@ struct Session {
     last_error: RefCell<Option<String>>,
     /// Automatic reconnects have given up; selecting the tab tries again.
     gave_up: Cell<bool>,
+    /// gliff is being installed on the machine; selecting the tab waits for
+    /// it instead of connecting into a half-written install.
+    installing: Cell<bool>,
     /// Recorded in the config on the first successful connect.
     remembered: Cell<bool>,
     /// The server is streaming: set by its Connected status, cleared when
@@ -204,6 +207,7 @@ impl Session {
             retries: Cell::new(0),
             last_error: RefCell::new(None),
             gave_up: Cell::new(false),
+            installing: Cell::new(false),
             remembered: Cell::new(false),
             connected: Cell::new(false),
             headless: Cell::new(false),
@@ -941,7 +945,7 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
 fn select_tab(ui: &Rc<App>, name: &str) {
     match find_session(ui, name) {
         Some(s) => {
-            if s.gave_up.get() {
+            if s.gave_up.get() && !s.installing.get() {
                 s.retries.set(0);
                 s.gave_up.set(false);
                 start_session(ui.clone(), s.clone());
@@ -1228,7 +1232,10 @@ fn offer_install(ui: Rc<App>, s: Rc<Session>, generation: u64) {
             return;
         }
         set_status(&ui, &s, &format!("Installing gliff on {host}…"));
-        match remote_install::install(&host, &ssh_args).await {
+        s.installing.set(true);
+        let outcome = remote_install::install(&host, &ssh_args).await;
+        s.installing.set(false);
+        match outcome {
             remote_install::Outcome::Ready(note) => {
                 tracing::info!(machine = %s.name, %note, "remote install");
                 if current() {

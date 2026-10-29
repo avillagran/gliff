@@ -134,47 +134,88 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def install(staged, version):
-    """Copy staged files into the home directory, replacing only our own."""
+def read_manifest():
     try:
-        owned = json.loads(MANIFEST.read_text()).get("files", {})
+        manifest = json.loads(MANIFEST.read_text())
     except FileNotFoundError:
-        owned = {}
+        return {}
+    except ValueError:
+        raise Refused("conflict", f"~/{MANIFEST.relative_to(HOME)} is not readable") from None
+    return manifest if isinstance(manifest, dict) else {}
+
+
+def write_atomic(target, data, mode):
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".gliff-", dir=target.parent)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, target)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def write_manifest(manifest):
+    write_atomic(MANIFEST, (json.dumps(manifest, indent=2) + "\n").encode(), 0o644)
+
+
+def owned_hashes(manifest, dest):
+    """The contents gliff may have left at `dest`, finished or not."""
+    return {h for h in (manifest.get("files", {}).get(dest), manifest.get("pending", {}).get(dest)) if h}
+
+
+def unfinished(manifest):
+    """An earlier install stopped part way: retry it even though gliff-server may be on PATH."""
+    return bool(manifest) and not manifest.get("complete", True)
+
+
+def desktop_exec(path):
+    """`path` as the program of a desktop entry's Exec key."""
+    arg = str(path)
+    if not re.fullmatch(r"[A-Za-z0-9_/.+,:@=-]+", arg):
+        arg = '"' + re.sub(r'(["`$\\])', lambda m: "\\" + m[1], arg) + '"'
+    # The key is itself an escaped string, and % starts a field code.
+    return arg.replace("\\", "\\\\").replace("%", "%%")
+
+
+def install(staged, version):
+    """Copy staged files into the home directory, replacing only our own.
+
+    The manifest is written before and after every file, so an install that
+    stops part way is still recognised as gliff's own and can be retried."""
+    manifest = read_manifest()
     for dest in FILES.values():
         target = HOME / dest
         if not os.path.lexists(target):
             continue
         meta = target.lstat()
         ours = (stat.S_ISREG(meta.st_mode) and meta.st_uid == os.getuid()
-                and owned.get(dest) == digest(target))
+                and digest(target) in owned_hashes(manifest, dest))
         if not ours:
             raise Refused("conflict", f"~/{dest} already exists and was not installed by gliff")
-    installed = {}
+    manifest = {"version": version, "complete": False,
+                "files": dict(manifest.get("files", {})), "pending": {}}
     for source, dest in FILES.items():
-        target = HOME / dest
-        target.parent.mkdir(parents=True, exist_ok=True)
         data = (staged / source).read_bytes()
         if source.endswith(".desktop"):
             # Launchers do not always see ~/.local/bin on PATH.
-            text = re.sub(r"^Exec=gliff\b", f"Exec={HOME / '.local/bin/gliff'}", data.decode(), flags=re.M)
-            data = text.encode()
-        fd, tmp = tempfile.mkstemp(prefix=".gliff-", dir=target.parent)
-        try:
-            with os.fdopen(fd, "wb") as out:
-                out.write(data)
-            os.chmod(tmp, 0o755 if source in BINARIES else 0o644)
-            os.replace(tmp, target)
-        finally:
-            if os.path.exists(tmp):
-                os.unlink(tmp)
-        installed[dest] = hashlib.sha256(data).hexdigest()
-    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-    MANIFEST.write_text(json.dumps({"version": version, "files": installed}, indent=2) + "\n")
+            exec_line = "Exec=" + desktop_exec(HOME / ".local/bin/gliff")
+            data = re.sub(r"^Exec=gliff\b", lambda _: exec_line, data.decode(), flags=re.M).encode()
+        manifest["pending"][dest] = hashlib.sha256(data).hexdigest()
+        write_manifest(manifest)
+        write_atomic(HOME / dest, data, 0o755 if source in BINARIES else 0o644)
+        manifest["files"][dest] = manifest["pending"].pop(dest)
+        write_manifest(manifest)
+    manifest["complete"] = True
+    del manifest["pending"]
+    write_manifest(manifest)
 
 
 def main():
     found = shutil.which("gliff-server")
-    if found:
+    if found and not unfinished(read_manifest()):
         return reply(ok=True, status="present", path=found)
     if not (shutil.which("Hyprland") or shutil.which("hyprctl")):
         raise Refused("hyprland", "gliff needs Hyprland on that machine")
