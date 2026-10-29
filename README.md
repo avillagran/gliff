@@ -2,6 +2,46 @@
 
 [![CI](https://github.com/omacom/gliff/actions/workflows/ci.yml/badge.svg)](https://github.com/omacom/gliff/actions/workflows/ci.yml)
 
+> **This is [Andrés Villagrán](https://github.com/avillagran)'s fork of
+> [omacom/gliff](https://github.com/omacom/gliff).** Its `main` is gliff's
+> `main` plus the pull requests below, which are open on gliff and not part
+> of it yet, so they can be used today. Each one lives on its own branch,
+> based on gliff's `main`, and is what gets reviewed upstream; once they are
+> merged, this fork follows gliff again.
+>
+> | Pull request | What it adds |
+> | --- | --- |
+> | [omacom/gliff#99](https://github.com/omacom/gliff/pull/99) | Offers to install gliff on a remote that lacks it |
+> | [omacom/gliff#100](https://github.com/omacom/gliff/pull/100) | Leaves fullscreen when the shown connection drops, and returns on reconnect |
+> | [omacom/gliff#101](https://github.com/omacom/gliff/pull/101) | `gliff --stdio` and `--fullscreen`: show a server whose stream arrives on stdin and stdout |
+> | [omacom/gliff#102](https://github.com/omacom/gliff/pull/102) | `gliff-server --position` and `--align`: place a headless output beside the other screens |
+> | [omacom/gliff#103](https://github.com/omacom/gliff/pull/103) | Use another machine's screen as one more screen of this one |
+>
+> Planned here, not sent to gliff: other protocols besides gliff's own,
+> starting with VNC, RDP and RustDesk.
+>
+> To install this fork instead of the gliff package, on each machine:
+>
+> ```
+> git clone https://github.com/avillagran/gliff.git
+> cd gliff
+> bin/install
+> ```
+>
+> `omarchy pkg add gliff` (or `sudo pacman -S gliff`) goes back to gliff's
+> own package.
+>
+> **Another machine as one more screen.** Select a machine's tab and press
+> the display button in the title bar. The first time, it asks on which
+> side of this computer's screens that machine's screen stands and how it
+> lines up (the gear button changes it later). A headless output appears
+> there, the other machine shows it fullscreen, and its keyboard and mouse
+> control the apps on it. Press the button again, or close either window,
+> to give the screen back. Only this machine needs ssh access to the other
+> one. The other machine needs gliff too. This fork's gliff there takes the
+> stream itself (`gliff --stdio`); gliff 0.4.1 or older still works,
+> through a relay that Hyprland makes fullscreen.
+
 gliff is a remote desktop for Hyprland. It shows the Hyprland session of
 another machine in a window on yours, and all it needs between the two is
 ssh: no open ports, no accounts, no relay.
