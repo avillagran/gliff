@@ -164,7 +164,9 @@ impl Drop for Display {
 /// closes the window, as `--stdio` does. Its window is made fullscreen
 /// through Hyprland once it maps, with a Lua config or an older one. That gliff
 /// keeps its own list of machines, so it gets a config directory that has
-/// everything but it.
+/// everything but it. It cannot leave a GPU whose decoding fails, as every
+/// NVIDIA one does through VA-API, so where all GPUs are NVIDIA it decodes
+/// on the CPU.
 ///
 /// It must hold no `'` or `\`, which the remote login shell would not keep.
 const REMOTE_SCRIPT: &str = r#"if "$1" --help 2>/dev/null | grep -q -- --stdio; then exec "$1" --stdio --fullscreen; fi
@@ -194,6 +196,11 @@ fi
 [ -n "$HYPRLAND_INSTANCE_SIGNATURE" ] || { echo "No Hyprland session is running there" >&2; exit 1; }
 [ -n "$WAYLAND_DISPLAY" ] || WAYLAND_DISPLAY=$(sed -n 2p "$r/hypr/$HYPRLAND_INSTANCE_SIGNATURE/hyprland.lock")
 export XDG_RUNTIME_DIR="$r" HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY
+v=
+for n in /sys/class/drm/renderD*/device/driver; do
+  case $(readlink "$n") in */nvidia) v=${v:-cpu} ;; *) v=gpu; break ;; esac
+done
+[ -n "$GLIFF_VIDEO" ] || [ "$v" != cpu ] || export GLIFF_VIDEO=cpu
 exec 3<&0 4>&1
 PATH="$d:$PATH" XDG_CONFIG_HOME="$d/config" "$1" --headless "$2" </dev/null >/dev/null &
 g=$!
