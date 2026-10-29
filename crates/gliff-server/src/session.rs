@@ -108,7 +108,14 @@ where
         cfg.target.instance().context("find Hyprland instance"),
     )
     .await?;
-    let output = report_setup(&mut writer, setup_output(&instance, &cfg, &caps)).await?;
+    // A headless output starts at the client's size cap, at most 1080p,
+    // until the client sends its window size.
+    let initial = (
+        caps.max_width.clamp(320, 1920) & !1,
+        caps.max_height.clamp(240, 1080) & !1,
+        1.0,
+    );
+    let output = report_setup(&mut writer, setup_output(&instance, &cfg, initial)).await?;
     tracing::info!(output = %output.name, output.width, output.height, headless = output.is_headless(), "session output ready");
 
     let video = VideoTier::open(cfg.video, cfg.capture, &cfg.render_node);
@@ -1580,11 +1587,11 @@ impl Drop for Session {
 /// The output with the capture and input threads that use it. Dropping it
 /// ends both threads before the output, on every exit from `run`, a `?`
 /// return or an unwinding panic included.
-struct ServedOutput<O, C, I> {
-    output: O,
+pub(crate) struct ServedOutput<O, C, I> {
+    pub(crate) output: O,
     /// `Some` until the drop.
-    capturer: Option<C>,
-    input: Option<I>,
+    pub(crate) capturer: Option<C>,
+    pub(crate) input: Option<I>,
 }
 
 impl<O, C, I> Drop for ServedOutput<O, C, I> {
@@ -1611,13 +1618,13 @@ impl<O, C, I> DerefMut for ServedOutput<O, C, I> {
 
 /// The output being served. A created headless output is removed on drop, on
 /// every exit path including a failure later in setup.
-struct SessionOutput {
-    name: String,
+pub(crate) struct SessionOutput {
+    pub(crate) name: String,
     /// Physical (captured) size.
-    width: u32,
-    height: u32,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
     /// Output scale; the logical size the pointer works in is size / scale.
-    scale: f32,
+    pub(crate) scale: f32,
     /// Where a headless output is kept among the other screens.
     placement: Option<Placement>,
     /// The placement is left to Hyprland's own `auto-*` positions, because
@@ -1628,7 +1635,7 @@ struct SessionOutput {
 }
 
 impl SessionOutput {
-    fn is_headless(&self) -> bool {
+    pub(crate) fn is_headless(&self) -> bool {
         self.headless.is_some()
     }
 
@@ -1668,7 +1675,7 @@ impl SessionOutput {
     }
 
     /// The logical extent Hyprland exposes to clients and the virtual pointer.
-    fn logical_extent(&self) -> InputCmd {
+    pub(crate) fn logical_extent(&self) -> InputCmd {
         let s = self.scale.max(0.5);
         InputCmd::SetExtent {
             width: (self.width as f32 / s).round().max(1.0) as u32,
@@ -1832,11 +1839,12 @@ fn other_positions(mons: &[hypr_ipc::Monitor], name: &str) -> Vec<(String, i32, 
     v
 }
 
-/// Pick the named output, or create a headless one sized to the client.
-fn setup_output(
+/// Pick the named output, or create a headless one in the `initial` mode
+/// (width, height, scale).
+pub(crate) fn setup_output(
     instance: &hypr_ipc::Instance,
     cfg: &Config,
-    caps: &ClientCaps,
+    (width, height, scale): (u32, u32, f32),
 ) -> Result<SessionOutput> {
     if let Some(name) = &cfg.output {
         let mons = instance.monitors()?;
@@ -1898,16 +1906,14 @@ fn setup_output(
             .context(e),
         None => e,
     })?;
-    let width = caps.max_width.clamp(320, 1920) & !1;
-    let height = caps.max_height.clamp(240, 1080) & !1;
-    let apply = |output: &SessionOutput| -> Result<(u32, u32, f32)> {
+    let apply = |output: &SessionOutput, scale: f32| -> Result<(u32, u32, f32)> {
         if let Err(e) = instance.set_monitor_rule(
             &output.name,
             width,
             height,
             60,
-            &output.position(instance, width, height, 1.0),
-            1.0,
+            &output.position(instance, width, height, scale),
+            scale,
         ) {
             tracing::warn!(error = %e, "could not set the headless output mode");
         }
@@ -1921,14 +1927,19 @@ fn setup_output(
                 continue;
             };
             applied = Some((m.width, m.height, m.scale));
-            if m.width == width && m.height == height {
+            if m.width == width && m.height == height && (m.scale - scale).abs() < 0.15 {
                 break;
             }
         }
         applied.context("headless output vanished")
     };
     let before = other_positions(&instance.monitors()?, &output.name);
-    let mut mode = apply(&output)?;
+    let mut mode = apply(&output, scale)?;
+    // The position follows from the logical size: place it again when
+    // Hyprland rounded the scale.
+    if output.placement.is_some() && (mode.2 - scale).abs() >= 0.001 {
+        mode = apply(&output, mode.2)?;
+    }
     // Hyprland places a screen whose position is `auto` after every fixed
     // one, so a fixed position for this output moves it. Leave the
     // placement to Hyprland then.
@@ -1944,7 +1955,7 @@ fn setup_output(
                 "other screens moved; placing relative to them"
             );
             output.relative = true;
-            mode = apply(&output)?;
+            mode = apply(&output, mode.2)?;
         }
     }
     let (w, h, scale) = mode;
@@ -2072,7 +2083,7 @@ fn start_input(target: &Target, output: &str, keymap: &str) -> Result<Input> {
 /// for the stream anyway, while each capture ring buffer grows with it.
 /// 4096 a side is the coded size the VA path assumes when the driver
 /// reports no maximum.
-const HEADLESS_LIMIT: SizeLimit = SizeLimit {
+pub(crate) const HEADLESS_LIMIT: SizeLimit = SizeLimit {
     side: 4096,
     pixels: 3840 * 2160,
 };
@@ -2094,7 +2105,7 @@ fn headless_cap(width: u32, height: u32) -> (u32, u32) {
 
 /// The headless mode to ask Hyprland for: the client's window within the
 /// server's cap, rounded so the scale divides it.
-fn headless_target(width: u32, height: u32, scale: f32) -> (u32, u32) {
+pub(crate) fn headless_target(width: u32, height: u32, scale: f32) -> (u32, u32) {
     let (width, height) = headless_cap(width, height);
     hypr_ipc::clean_mode(width, height, scale)
 }
