@@ -20,6 +20,7 @@ use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver};
 use std::time::{Duration, Instant};
 
@@ -265,7 +266,24 @@ fn main() -> glib::ExitCode {
     app.connect_activate(move |app| build_ui(app, &cli));
     // GTK owns argv parsing; we already parsed with clap, so pass none.
     let empty: Vec<String> = vec![];
-    app.run_with_args(&empty)
+    let code = app.run_with_args(&empty);
+    if STDIO_FAILED.load(Ordering::Relaxed) {
+        return glib::ExitCode::FAILURE;
+    }
+    code
+}
+
+/// A --stdio stream ended on an error rather than by either side closing
+/// it: the process exits unsuccessfully, so the machine that started it
+/// can tell the user why.
+static STDIO_FAILED: AtomicBool = AtomicBool::new(false);
+
+/// End a --stdio window on `error`, already logged. Its last stderr line
+/// is the reason the other machine shows.
+fn fail_stdio(ui: &App, error: &str) {
+    eprintln!("{error}");
+    STDIO_FAILED.store(true, Ordering::Relaxed);
+    ui.window.close();
 }
 
 /// A command run over ssh has no `WAYLAND_DISPLAY`: show the window on the
@@ -1310,10 +1328,10 @@ fn schedule_reconnect(ui: Rc<App>, s: Rc<Session>, generation: u64, error: Optio
     // Only the machine at the other end can start a --stdio session again;
     // a window left open would keep its screen.
     if matches!(s.endpoint, Endpoint::Stdio(_)) {
-        if let Some(error) = error {
-            tracing::error!(machine = %s.name, %error, "stdio session ended");
+        match error {
+            Some(error) => fail_stdio(&ui, error),
+            None => ui.window.close(),
         }
-        ui.window.close();
         return;
     }
     let n = s.retries.get() + 1;
@@ -1580,7 +1598,7 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     show_disconnected(&ui, &s);
                     s.gave_up.set(true);
                     if matches!(s.endpoint, Endpoint::Stdio(_)) {
-                        ui.window.close();
+                        fail_stdio(&ui, &message);
                     }
                     return glib::ControlFlow::Break;
                 }
