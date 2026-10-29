@@ -7,7 +7,9 @@
 
 mod clipboard;
 mod clipboard_ui;
+mod display;
 mod keymap;
+mod monitor;
 mod net;
 mod paintable;
 mod recent;
@@ -69,6 +71,10 @@ struct Cli {
     /// Remote gliff-server path.
     #[arg(long, default_value = "gliff-server")]
     server_bin: String,
+    /// The other machine's gliff, for using its screen as one of this
+    /// machine's.
+    #[arg(long, default_value = "gliff")]
+    remote_gliff: String,
     /// Create a private headless output on the remote, sized and scaled to
     /// this window, instead of mirroring the remote's focused screen.
     #[arg(long, conflicts_with = "output")]
@@ -138,6 +144,8 @@ struct App {
     /// keyboard stays local until the pointer leaves, or the picture is
     /// clicked.
     released: Cell<bool>,
+    /// The header's screen buttons; set once the window is built.
+    monitor: RefCell<Option<Rc<monitor::Controller>>>,
     config_path: PathBuf,
     cli: Cli,
     keymap: keymap::Keymap,
@@ -380,6 +388,18 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     header.pack_start(&add_revealer);
     header.pack_end(&fullscreen_btn);
     header.pack_end(&stats_btn);
+    let monitor_btn = gtk::Button::builder()
+        .icon_name("video-display-symbolic")
+        .build();
+    let monitor_settings_btn = gtk::Button::builder()
+        .icon_name("emblem-system-symbolic")
+        .tooltip_text("Where the other machine's screen stands")
+        .build();
+    // A --stdio window is itself the other machine's screen.
+    if !cli.stdio {
+        header.pack_end(&monitor_btn);
+        header.pack_end(&monitor_settings_btn);
+    }
 
     let stats = gtk::Label::builder()
         .halign(gtk::Align::Start)
@@ -464,6 +484,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         view_scale: Cell::new(1.0),
         pressed_keys: RefCell::new(BTreeSet::new()),
         released: Cell::new(false),
+        monitor: RefCell::new(None),
         config_path: Config::default_path(),
         cli: cli.clone(),
         keymap: keymap::watch(),
@@ -476,6 +497,11 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     install_input_handlers(&ui, &video, &window, hotkey);
     install_resize_handler(&ui);
     install_address_bar(&ui, &connect_btn);
+    *ui.monitor.borrow_mut() = Some(monitor::Controller::install(
+        &ui,
+        &monitor_btn,
+        &monitor_settings_btn,
+    ));
     refresh_tabs(&ui);
 
     // Fullscreen toggle.
@@ -857,7 +883,8 @@ fn refresh_tabs(ui: &Rc<App>) {
 /// can be dragged into a new order.
 fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     let session = find_session(ui, name);
-    let running = session.is_some();
+    let screen_in_use = ui.monitor.borrow().as_ref().is_some_and(|m| m.owns(name));
+    let running = session.is_some() || screen_in_use;
     // The name is a plain label and the whole tab takes the click, so no
     // part of a tab takes keyboard focus and grows a focus ring.
     let label = gtk::Label::builder()
@@ -898,7 +925,15 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         .focusable(false)
         .build();
     let tab = gtk::Box::builder().css_classes(["machine-tab"]).build();
-    if session.as_ref().is_some_and(|s| is_active(ui, s)) {
+    let chosen = || {
+        active(ui).is_none()
+            && ui
+                .monitor
+                .borrow()
+                .as_ref()
+                .is_some_and(|m| m.chosen().as_deref() == Some(name))
+    };
+    if session.as_ref().is_some_and(|s| is_active(ui, s)) || chosen() {
         tab.add_css_class("active");
     }
     tab.append(&label);
@@ -946,7 +981,11 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         action.connect_clicked(move |_| {
             let (ui, name) = (ui.clone(), name.clone());
             glib::idle_add_local_once(move || {
-                if running {
+                if screen_in_use {
+                    if let Some(m) = ui.monitor.borrow().clone() {
+                        m.stop();
+                    }
+                } else if running {
                     stop_session(&ui, &name);
                 } else {
                     forget_machine(&ui, &name);
@@ -995,6 +1034,13 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
 /// Show a machine's tab: switch to its running session, retrying one whose
 /// reconnects gave up, or connect to it.
 fn select_tab(ui: &Rc<App>, name: &str) {
+    // A machine lending its screen is not also shown here unless asked
+    // for: connecting to it would show this screen inside itself.
+    let lending = ui.monitor.borrow().as_ref().is_some_and(|m| m.owns(name));
+    if lending && find_session(ui, name).is_none() {
+        show_lending(ui, name);
+        return;
+    }
     match find_session(ui, name) {
         Some(s) => {
             if s.gave_up.get() {
@@ -1008,6 +1054,17 @@ fn select_tab(ui: &Rc<App>, name: &str) {
     }
 }
 
+/// Select `name`'s tab while its screen is in use here, without its
+/// session, which would show this screen inside itself.
+fn show_lending(ui: &Rc<App>, name: &str) {
+    show_nothing(ui);
+    stop_session(ui, name);
+    show_status(
+        ui,
+        &format!("{name}'s screen is in use as a screen of this computer."),
+    );
+}
+
 /// Connect to `endpoint` in a new session and show it.
 fn open_session(ui: &Rc<App>, endpoint: Endpoint) {
     let s = Rc::new(Session::new(endpoint));
@@ -1018,6 +1075,9 @@ fn open_session(ui: &Rc<App>, endpoint: Endpoint) {
 
 /// Make `s` the session the window shows and sends input to.
 fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
+    if let Some(m) = ui.monitor.borrow().as_ref() {
+        m.unchoose();
+    }
     if !is_active(ui, s) {
         release_pressed_keys(ui);
         let previous = ui.active.replace(Some(s.clone()));
