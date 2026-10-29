@@ -685,6 +685,7 @@ impl Session {
         // Hyprland applies the mode asynchronously and may round the scale
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
+        self.place_at(width, height, scale, applied).await;
         if !same_size {
             let base = EncoderSettings::fit_extent(width, height, self.encoder_max);
             if base != (width, height) {
@@ -715,7 +716,8 @@ impl Session {
                         s,
                     )
                     .ok();
-                self.wait_for_mode(old_w, old_h, s).await;
+                let applied = self.wait_for_mode(old_w, old_h, s).await;
+                self.place_at(old_w, old_h, s, applied).await;
                 self.inject(self.output.logical_extent());
                 return Ok(());
             }
@@ -753,6 +755,25 @@ impl Session {
             self.base_stream = old_base;
         }
         Ok(())
+    }
+
+    /// A placed output's position follows from its logical size, so when
+    /// Hyprland rounded the scale it was asked for, place it again at the
+    /// scale in effect.
+    async fn place_at(&self, width: u32, height: u32, requested: f32, applied: f32) {
+        if self.output.placement.is_none() || (applied - requested).abs() < 0.001 {
+            return;
+        }
+        let position = self.output.position(&self.instance, width, height, applied);
+        tracing::info!(requested, applied, %position, "placing the output at the scale in effect");
+        if let Err(e) =
+            self.instance
+                .set_monitor_rule(&self.output.name, width, height, 60, &position, applied)
+        {
+            tracing::warn!(error = %e, "could not place the headless output");
+            return;
+        }
+        self.wait_for_mode(width, height, applied).await;
     }
 
     /// Poll until the output reports the requested mode (Hyprland applies it
