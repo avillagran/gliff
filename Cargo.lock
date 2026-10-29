@@ -700,6 +700,7 @@ dependencies = [
  "gliff-vk",
  "gtk4",
  "hypr-capture",
+ "hypr-edge",
  "hypr-input",
  "hypr-ipc",
  "libadwaita",
@@ -709,6 +710,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "xkbcommon",
 ]
 
 [[package]]
