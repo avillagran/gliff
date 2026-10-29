@@ -24,12 +24,14 @@ PACMAN_CONF = pathlib.Path("/etc/pacman.conf")
 KEYRING = pathlib.Path("/etc/pacman.d/gnupg")
 HOME = pathlib.Path.home()
 MANIFEST = HOME / ".local/share/gliff/user-install.json"
-# Package path -> where it goes, relative to the home directory.
+# Package path -> where it goes, relative to the home directory, in the order
+# they are written. gliff-server goes last: the client offers to install only
+# while it is missing, so an install that stops part way is offered again.
 FILES = {
     "usr/bin/gliff": ".local/bin/gliff",
-    "usr/bin/gliff-server": ".local/bin/gliff-server",
     "usr/share/applications/gliff.desktop": ".local/share/applications/gliff.desktop",
     "usr/share/icons/hicolor/scalable/apps/gliff.svg": ".local/share/icons/hicolor/scalable/apps/gliff.svg",
+    "usr/bin/gliff-server": ".local/bin/gliff-server",
 }
 BINARIES = ["usr/bin/gliff", "usr/bin/gliff-server"]
 
@@ -140,7 +142,8 @@ def read_manifest():
     except FileNotFoundError:
         return {}
     except ValueError:
-        raise Refused("conflict", f"~/{MANIFEST.relative_to(HOME)} is not readable") from None
+        name = MANIFEST.relative_to(HOME)
+        raise Refused("conflict", f"~/{name} is not readable; delete it to install again") from None
     return manifest if isinstance(manifest, dict) else {}
 
 
@@ -184,7 +187,9 @@ def install(staged, version):
     """Copy staged files into the home directory, replacing only our own.
 
     The manifest is written before and after every file, so an install that
-    stops part way is still recognised as gliff's own and can be retried."""
+    stops part way is still recognised as gliff's own and can be retried, and
+    gliff-server is written last, so until it is in place the client keeps
+    offering that retry."""
     manifest = read_manifest()
     for dest in FILES.values():
         target = HOME / dest
@@ -204,8 +209,11 @@ def install(staged, version):
             exec_line = "Exec=" + desktop_exec(HOME / ".local/bin/gliff")
             data = re.sub(r"^Exec=gliff\b", lambda _: exec_line, data.decode(), flags=re.M).encode()
         manifest["pending"][dest] = hashlib.sha256(data).hexdigest()
-        write_manifest(manifest)
-        write_atomic(HOME / dest, data, 0o755 if source in BINARIES else 0o644)
+        try:
+            write_manifest(manifest)
+            write_atomic(HOME / dest, data, 0o755 if source in BINARIES else 0o644)
+        except OSError as e:
+            raise Refused("write", f"Cannot write ~/{dest}: {e.strerror or e}") from None
         manifest["files"][dest] = manifest["pending"].pop(dest)
         write_manifest(manifest)
     manifest["complete"] = True
