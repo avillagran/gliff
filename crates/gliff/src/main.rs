@@ -669,11 +669,13 @@ fn install_address_bar(ui: &Rc<App>, connect_btn: &gtk::Button) {
 }
 
 /// Show the address bar in place of the +, or fold it back. With no tabs
-/// the address bar is all there is, so it stays.
+/// the address bar is all there is, so it stays. A --stdio window has
+/// neither: it closes with its one stream, and would take any other
+/// machine opened in it along.
 fn show_address_bar(ui: &App, show: bool) {
-    let show = show || ui.tabs.first_child().is_none();
+    let show = !ui.cli.stdio && (show || ui.tabs.first_child().is_none());
     ui.add_revealer.set_reveal_child(show);
-    ui.add_btn.set_visible(!show);
+    ui.add_btn.set_visible(!show && !ui.cli.stdio);
     // A folded address bar must not keep the focus GTK gave it when the
     // window opened, or hovering the picture would never capture.
     if !show && address_bar_in_use(&ui.window, &ui.entry) {
@@ -685,7 +687,7 @@ fn show_address_bar(ui: &App, show: bool) {
 /// is already connected.
 fn connect_from_address_bar(ui: &Rc<App>) {
     let machine = ui.entry.text().trim().to_string();
-    if machine.is_empty() {
+    if machine.is_empty() || ui.cli.stdio {
         return;
     }
     ui.entry.set_text("");
