@@ -35,6 +35,9 @@ use crate::notify;
 pub struct Config {
     pub target: Target,
     pub output: Option<String>,
+    /// Where a headless output goes among the local screens; `None` lets
+    /// Hyprland choose.
+    pub placement: Option<Placement>,
     pub render_node: PathBuf,
     pub low_bandwidth: bool,
     pub bitrate: Option<u32>,
@@ -668,16 +671,21 @@ impl Session {
             return Ok(());
         }
         tracing::info!(width, height, scale, "resizing headless output");
-        if let Err(e) = self
-            .instance
-            .set_monitor_mode(&self.output.name, width, height, 60, scale)
-        {
+        if let Err(e) = self.instance.set_monitor_rule(
+            &self.output.name,
+            width,
+            height,
+            60,
+            &self.output.position(&self.instance, width, height, scale),
+            scale,
+        ) {
             tracing::warn!(error = %e, "could not resize the headless output");
             return Ok(());
         }
         // Hyprland applies the mode asynchronously and may round the scale
         // so the logical size is whole; wait for it and use what it chose.
         let applied = self.wait_for_mode(width, height, scale).await;
+        self.place_at(width, height, scale, applied).await;
         if !same_size {
             let base = EncoderSettings::fit_extent(width, height, self.encoder_max);
             if base != (width, height) {
@@ -699,9 +707,17 @@ impl Session {
                 self.output.height = old_h;
                 let s = self.output.scale;
                 self.instance
-                    .set_monitor_mode(&self.output.name, old_w, old_h, 60, s)
+                    .set_monitor_rule(
+                        &self.output.name,
+                        old_w,
+                        old_h,
+                        60,
+                        &self.output.position(&self.instance, old_w, old_h, s),
+                        s,
+                    )
                     .ok();
-                self.wait_for_mode(old_w, old_h, s).await;
+                let applied = self.wait_for_mode(old_w, old_h, s).await;
+                self.place_at(old_w, old_h, s, applied).await;
                 self.inject(self.output.logical_extent());
                 return Ok(());
             }
@@ -739,6 +755,25 @@ impl Session {
             self.base_stream = old_base;
         }
         Ok(())
+    }
+
+    /// A placed output's position follows from its logical size, so when
+    /// Hyprland rounded the scale it was asked for, place it again at the
+    /// scale in effect.
+    async fn place_at(&self, width: u32, height: u32, requested: f32, applied: f32) {
+        if self.output.placement.is_none() || (applied - requested).abs() < 0.001 {
+            return;
+        }
+        let position = self.output.position(&self.instance, width, height, applied);
+        tracing::info!(requested, applied, %position, "placing the output at the scale in effect");
+        if let Err(e) =
+            self.instance
+                .set_monitor_rule(&self.output.name, width, height, 60, &position, applied)
+        {
+            tracing::warn!(error = %e, "could not place the headless output");
+            return;
+        }
+        self.wait_for_mode(width, height, applied).await;
     }
 
     /// Poll until the output reports the requested mode (Hyprland applies it
@@ -1583,6 +1618,8 @@ struct SessionOutput {
     height: u32,
     /// Output scale; the logical size the pointer works in is size / scale.
     scale: f32,
+    /// Where a headless output is kept among the other screens.
+    placement: Option<Placement>,
     headless: Option<hypr_ipc::Instance>,
     awake: Option<KeepAwake>,
 }
@@ -1590,6 +1627,38 @@ struct SessionOutput {
 impl SessionOutput {
     fn is_headless(&self) -> bool {
         self.headless.is_some()
+    }
+
+    /// The monitor position for this output at a new mode: beside the other
+    /// screens as placed, recomputed for each size.
+    fn position(
+        &self,
+        instance: &hypr_ipc::Instance,
+        width: u32,
+        height: u32,
+        scale: f32,
+    ) -> String {
+        let Some(placement) = self.placement else {
+            return "auto".into();
+        };
+        let others: Vec<Screen> = match instance.monitors() {
+            Ok(mons) => mons
+                .iter()
+                .filter(|m| m.name != self.name && !m.disabled)
+                .map(Screen::of)
+                .collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "cannot read the screens to place the output");
+                return "auto".into();
+            }
+        };
+        let s = scale.max(0.5);
+        let size = (
+            (width as f32 / s).round() as i32,
+            (height as f32 / s).round() as i32,
+        );
+        let (x, y) = placement.position(&others, size);
+        format!("{x}x{y}")
     }
 
     /// The logical extent Hyprland exposes to clients and the virtual pointer.
@@ -1657,6 +1726,79 @@ fn encoder_settings(
     }
 }
 
+/// The side of the other screens a headless output goes on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Left,
+    Right,
+    Above,
+    Below,
+}
+
+/// Which edges line up along that side: top or left (`Start`), the middles,
+/// or bottom or right (`End`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Align {
+    Start,
+    Center,
+    End,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Placement {
+    pub side: Edge,
+    pub align: Align,
+}
+
+/// A screen in Hyprland's layout coordinates (logical pixels).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Screen {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+impl Screen {
+    fn of(m: &hypr_ipc::Monitor) -> Self {
+        let (w, h) = if m.transform & 1 != 0 {
+            (m.height, m.width)
+        } else {
+            (m.width, m.height)
+        };
+        let s = m.scale.max(0.5);
+        Self {
+            x: m.x,
+            y: m.y,
+            width: (w as f32 / s).round() as i32,
+            height: (h as f32 / s).round() as i32,
+        }
+    }
+}
+
+impl Placement {
+    /// Top-left corner of a `size` screen beside the box around `others`.
+    fn position(self, others: &[Screen], (width, height): (i32, i32)) -> (i32, i32) {
+        let Some(left) = others.iter().map(|r| r.x).min() else {
+            return (0, 0);
+        };
+        let top = others.iter().map(|r| r.y).min().unwrap_or(0);
+        let right = others.iter().map(|r| r.x + r.width).max().unwrap_or(0);
+        let bottom = others.iter().map(|r| r.y + r.height).max().unwrap_or(0);
+        let along = |start: i32, end: i32, len: i32| match self.align {
+            Align::Start => start,
+            Align::Center => start + (end - start - len) / 2,
+            Align::End => end - len,
+        };
+        match self.side {
+            Edge::Left => (left - width, along(top, bottom, height)),
+            Edge::Right => (right, along(top, bottom, height)),
+            Edge::Above => (along(left, right, width), top - height),
+            Edge::Below => (along(left, right, width), bottom),
+        }
+    }
+}
+
 /// Pick the named output, or create a headless one sized to the client.
 fn setup_output(
     instance: &hypr_ipc::Instance,
@@ -1684,6 +1826,7 @@ fn setup_output(
                 m.height
             } & !1,
             scale: m.scale,
+            placement: None,
             headless: None,
             awake: None,
         });
@@ -1704,6 +1847,7 @@ fn setup_output(
         width: 0,
         height: 0,
         scale: 1.0,
+        placement: cfg.placement,
         headless: Some(instance.clone()),
         awake: None,
     };
@@ -1721,7 +1865,14 @@ fn setup_output(
     })?;
     let width = caps.max_width.clamp(320, 1920) & !1;
     let height = caps.max_height.clamp(240, 1080) & !1;
-    if let Err(e) = instance.set_monitor_mode(&output.name, width, height, 60, 1.0) {
+    if let Err(e) = instance.set_monitor_rule(
+        &output.name,
+        width,
+        height,
+        60,
+        &output.position(instance, width, height, 1.0),
+        1.0,
+    ) {
         tracing::warn!(error = %e, "could not set the headless output mode");
     }
     // Hyprland applies the mode asynchronously; stream whatever it settled
@@ -1976,6 +2127,37 @@ mod tests {
             ..caps
         };
         assert!(stream_limit((4096, 4096), &bad).is_err());
+    }
+
+    #[test]
+    fn placement_lines_up_with_the_other_screens() {
+        // A 1920x1080 screen with a 1280x800 one to its right, lower.
+        let others = [
+            Screen {
+                x: 0,
+                y: 0,
+                width: 1920,
+                height: 1080,
+            },
+            Screen {
+                x: 1920,
+                y: 280,
+                width: 1280,
+                height: 800,
+            },
+        ];
+        let at = |side, align| Placement { side, align }.position(&others, (1000, 600));
+        assert_eq!(at(Edge::Right, Align::Start), (3200, 0));
+        assert_eq!(at(Edge::Right, Align::Center), (3200, 240));
+        assert_eq!(at(Edge::Right, Align::End), (3200, 480));
+        assert_eq!(at(Edge::Left, Align::Start), (-1000, 0));
+        assert_eq!(at(Edge::Above, Align::Center), (1100, -600));
+        assert_eq!(at(Edge::Below, Align::End), (2200, 1080));
+        let alone = Placement {
+            side: Edge::Left,
+            align: Align::Start,
+        };
+        assert_eq!(alone.position(&[], (800, 600)), (0, 0));
     }
 
     #[test]
