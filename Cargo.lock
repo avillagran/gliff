@@ -739,6 +739,7 @@ dependencies = [
  "gliff-vk",
  "gtk4",
  "hypr-capture",
+ "hypr-edge",
  "hypr-input",
  "hypr-ipc",
  "libadwaita",
@@ -750,6 +751,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "xkbcommon",
 ]
 
 [[package]]
@@ -801,6 +803,7 @@ dependencies = [
  "gliff-vk",
  "gliff-vnc",
  "hypr-capture",
+ "hypr-edge",
  "hypr-input",
  "hypr-ipc",
  "hypr-wl",
@@ -1014,6 +1017,21 @@ dependencies = [
  "tracing",
  "wayland-client",
  "wayland-protocols",
+]
+
+[[package]]
+name = "hypr-edge"
+version = "0.4.1"
+dependencies = [
+ "calloop",
+ "hypr-ipc",
+ "hypr-wl",
+ "nix",
+ "thiserror",
+ "tracing",
+ "wayland-client",
+ "wayland-protocols",
+ "wayland-protocols-wlr",
 ]
 
 [[package]]

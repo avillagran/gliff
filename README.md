@@ -182,6 +182,23 @@ gliff-server --vnc 0.0.0.0:5900 --headless --size 1024x768 \
 See [docs/vnc.md](docs/vnc.md) for the options, the clients it works with,
 and what to know about VNC's security.
 
+**One mouse and keyboard for several machines.** `--control SIDE:HOST`
+places another machine beside this one's screens, with no window and no
+video: push the pointer past that edge (`left`, `right`, `above` or `below`)
+and it carries on across the other machine's screen, and the keyboard goes
+with it. Cross back over the same edge, or press the release hotkey
+(`Shift+Esc`, or a chord given to `--release-hotkey`), to come back. Give it
+once for each machine:
+
+```
+gliff --control left:user@laptop --control right:user@desktop
+```
+
+The other machine needs a `gliff-server` that knows `--control`; the pointer
+moves on its screen on the side facing this one. A machine that cannot be
+reached leaves its edge inactive until gliff connects to it again. The
+clipboard is not shared this way yet.
+
 ## If something does not work
 
 - Run `gliff-probe all` on each machine. It checks the compositor, the GPU
