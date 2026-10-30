@@ -333,6 +333,15 @@ impl State {
         Some(c.edge)
     }
 
+    /// The compositor took the pointer back. An edge kept on its screen
+    /// while it held the pointer moves now, as after a release.
+    fn lose_capture(&mut self) {
+        if self.end_capture().is_some() {
+            self.emit(EdgeEvent::Lost);
+            self.refresh_edges();
+        }
+    }
+
     fn release(&mut self, along: f64) {
         let Some(i) = self.end_capture() else {
             return;
@@ -507,10 +516,7 @@ impl Dispatch<WlPointer, ()> for State {
                     state.start_capture(i, serial, surface_x, surface_y);
                 }
             }
-            wl_pointer::Event::Leave { .. } if captured => {
-                state.end_capture();
-                state.emit(EdgeEvent::Lost);
-            }
+            wl_pointer::Event::Leave { .. } if captured => state.lose_capture(),
             wl_pointer::Event::Button {
                 button,
                 state: WEnum::Value(pressed),
@@ -653,8 +659,7 @@ impl Dispatch<ZwpLockedPointerV1, ()> for State {
             (zwp_locked_pointer_v1::Event::Locked, true) => tracing::debug!("pointer locked"),
             (zwp_locked_pointer_v1::Event::Unlocked, true) => {
                 tracing::debug!("the compositor ended the pointer lock");
-                state.end_capture();
-                state.emit(EdgeEvent::Lost);
+                state.lose_capture();
             }
             _ => {}
         }
