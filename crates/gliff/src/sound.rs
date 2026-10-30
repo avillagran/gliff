@@ -11,7 +11,7 @@
 //! a suspended output's saved mute when it wakes, which would undo it.
 
 use std::cell::RefCell;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
@@ -29,6 +29,11 @@ const RAW: [&str; 7] = [
     "--channels",
     "2",
 ];
+/// Sound held back before the first byte plays: 100 ms of 48 kHz 16-bit
+/// stereo. It arrives in bursts about 21 ms apart, and over WiFi one is now
+/// and then 70 ms late, which `--latency` does not absorb: `pw-play` keeps
+/// no queue of its own, so the queue is what waits in its stdin.
+const CUSHION: usize = 19_200;
 /// How many of the last stderr lines are kept to explain a failure.
 const STDERR_LINES: usize = 4;
 
@@ -81,7 +86,7 @@ impl Sound {
             .args(RAW)
             .args(["--latency", LATENCY])
             .stdin(Stdio::null())
-            .stdout(Stdio::from(to_player))
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn();
         let mut ssh = match ssh {
@@ -93,6 +98,9 @@ impl Sound {
             }
         };
         let said = Arc::new(Mutex::new(Vec::<String>::new()));
+        if let Some(sound) = ssh.stdout.take() {
+            std::thread::spawn(move || relay(sound, to_player));
+        }
         if let Some(stderr) = ssh.stderr.take() {
             let said = said.clone();
             std::thread::spawn(move || {
@@ -157,6 +165,22 @@ impl Drop for Sound {
     }
 }
 
+/// Pass the sound on once [`CUSHION`] of it has arrived, so the player's
+/// input stays that far ahead. Ending `from` ends `to`.
+fn relay(mut from: impl Read, mut to: impl Write) {
+    let mut held = vec![0; CUSHION];
+    let mut len = 0;
+    while len < CUSHION {
+        match from.read(&mut held[len..]) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => len += n,
+        }
+    }
+    if to.write_all(&held[..len]).is_ok() {
+        let _ = std::io::copy(&mut from, &mut to);
+    }
+}
+
 /// The local player's arguments: raw audio on stdin, in a stream named
 /// after the machine it comes from.
 fn player_args(host: &str) -> Vec<String> {
@@ -192,6 +216,39 @@ mod tests {
     #[test]
     fn remote_script_survives_the_remote_shell() {
         assert!(!REMOTE_SCRIPT.contains(['\'', '\\']));
+    }
+
+    #[test]
+    fn sound_is_held_until_the_cushion_fills() {
+        /// Sends what it reads into a channel, so the test can see when.
+        struct Tell(std::sync::mpsc::Sender<Vec<u8>>);
+        impl Write for Tell {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                let _ = self.0.send(data.to_vec());
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (mut feed, from) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (tx, written) = std::sync::mpsc::channel();
+        let relaying = std::thread::spawn(move || relay(from, Tell(tx)));
+        let wait = std::time::Duration::from_millis(50);
+
+        feed.write_all(&vec![1; CUSHION - 1]).unwrap();
+        assert!(written.recv_timeout(wait).is_err(), "nothing plays yet");
+        feed.write_all(&[2]).unwrap();
+        assert_eq!(written.recv().unwrap().len(), CUSHION);
+        feed.write_all(&[3]).unwrap();
+        assert_eq!(written.recv().unwrap(), vec![3]);
+        // The end of the sound lets go of what is held.
+        drop(feed);
+        relaying.join().unwrap();
+
+        let mut out = Vec::new();
+        relay(&[4u8; 10][..], &mut out);
+        assert_eq!(out, vec![4; 10]);
     }
 
     #[test]
