@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use gliff_proto::{ClientCaps, ClientMsg, ServerMsg, PROTOCOL_VERSION};
+use gliff_proto::{ClientCaps, ClientMsg, ServerMsg, FEATURE_KEYBOARD_LOCKS, PROTOCOL_VERSION};
 use gliff_transport::Framed;
 use gliff_transport::{spawn_ssh, SshStream, SshTarget};
 use hypr_edge::{EdgeCmd, EdgeConfig, EdgeEvent, Edges, Side};
@@ -115,6 +115,16 @@ fn key_state(keymap: &str) -> Option<xkb::State> {
     Some(xkb::State::new(&keymap))
 }
 
+/// The layout in effect and the locked modifiers, by name, of `keys`.
+fn locks_of(keys: &xkb::State) -> (u32, Vec<String>) {
+    let keymap = keys.get_keymap();
+    let locked = (0..keymap.num_mods())
+        .filter(|&i| keys.mod_index_is_active(i, xkb::STATE_MODS_LOCKED))
+        .map(|i| keymap.mod_get_name(i).to_string())
+        .collect();
+    (keys.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE), locked)
+}
+
 /// What a link reports to the controller.
 struct Up {
     side: Side,
@@ -136,6 +146,8 @@ struct Active {
     y: f64,
     keys: BTreeSet<u32>,
     buttons: BTreeSet<u32>,
+    /// The layout and locks last sent there.
+    locks: Option<(u32, Vec<String>)>,
 }
 
 pub fn run(controls: &[Control], server_bin: &str, hotkey: &str) -> anyhow::Result<()> {
@@ -311,6 +323,7 @@ impl Controller {
                 if let Some(keys) = self.keys.as_mut() {
                     keys.update_mask(depressed, latched, locked, 0, 0, group);
                 }
+                self.send_locks();
             }
             EdgeEvent::Button { button, pressed } => {
                 let Some(a) = self.active.as_mut() else {
@@ -367,8 +380,27 @@ impl Controller {
             y,
             keys: BTreeSet::new(),
             buttons: BTreeSet::new(),
+            locks: None,
         });
         self.send(side, ClientMsg::PointerMotion { x, y });
+        self.send_locks();
+    }
+
+    /// Give the other machine this keyboard's layout and locks (Caps Lock,
+    /// Num Lock) when they differ from what it last got, so keys type there
+    /// as they would here.
+    fn send_locks(&mut self) {
+        let (Some(keys), Some(a)) = (self.keys.as_ref(), self.active.as_mut()) else {
+            return;
+        };
+        let locks = locks_of(keys);
+        if a.locks.as_ref() == Some(&locks) {
+            return;
+        }
+        a.locks = Some(locks.clone());
+        let side = a.side;
+        let (layout, locked) = locks;
+        self.send(side, ClientMsg::KeyboardLocks { layout, locked });
     }
 
     fn motion(&mut self, dx: f64, dy: f64) {
@@ -529,10 +561,15 @@ async fn session(
             },
         })
         .await?;
-    let extent = loop {
+    // Whether that server takes `KeyboardLocks`; one that does not is not
+    // sent them.
+    let (extent, takes_locks) = loop {
         match reader.read_msg::<ServerMsg>().await? {
             ServerMsg::HelloAck {
-                version, outputs, ..
+                version,
+                outputs,
+                features,
+                ..
             } => {
                 anyhow::ensure!(
                     version == PROTOCOL_VERSION,
@@ -544,8 +581,11 @@ async fn session(
                 let s = f64::from(o.scale_milli.max(500)) / 1000.0;
                 tracing::debug!(output = %o.name, "controlling");
                 break (
-                    (f64::from(o.width) / s).round().max(1.0),
-                    (f64::from(o.height) / s).round().max(1.0),
+                    (
+                        (f64::from(o.width) / s).round().max(1.0),
+                        (f64::from(o.height) / s).round().max(1.0),
+                    ),
+                    features.iter().any(|f| f == FEATURE_KEYBOARD_LOCKS),
                 );
             }
             ServerMsg::Error { message, .. } => anyhow::bail!("{message}"),
@@ -561,6 +601,7 @@ async fn session(
     loop {
         tokio::select! {
             msg = out.recv() => match msg {
+                Some(ClientMsg::KeyboardLocks { .. }) if !takes_locks => {}
                 Some(msg) => writer.write_msg(&msg).await?,
                 None => return Ok(()),
             },
@@ -599,6 +640,26 @@ mod tests {
         assert!(parse("node@NODE.local").is_err());
         assert!(parse("middle:host").is_err());
         assert!(parse("right:").is_err());
+    }
+
+    #[test]
+    fn names_the_layout_and_locks_in_effect() {
+        let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &ctx,
+            "",
+            "",
+            "us,es",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        let mut keys = xkb::State::new(&keymap);
+        assert_eq!(locks_of(&keys), (0, Vec::new()));
+        let caps = 1 << keymap.mod_get_index(xkb::MOD_NAME_CAPS);
+        keys.update_mask(0, 0, caps, 0, 0, 1);
+        assert_eq!(locks_of(&keys), (1, vec![xkb::MOD_NAME_CAPS.to_string()]));
     }
 
     #[test]
