@@ -31,4 +31,5 @@ hypr-edge.workspace = true
 xkbcommon.workspace = true
 dbus = "0.9"
 serde.workspace = true
+serde_json.workspace = true
 toml = "1"
