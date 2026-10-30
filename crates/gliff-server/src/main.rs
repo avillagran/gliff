@@ -4,7 +4,6 @@
 
 #![forbid(unsafe_code)]
 
-mod clipboard;
 mod control;
 mod notify;
 mod rate;

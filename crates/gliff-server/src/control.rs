@@ -3,19 +3,28 @@
 //! pointer is bound to the screen on that side, which the client's pointer
 //! crosses into.
 
+use std::rc::Rc;
+
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::mpsc;
 
+use gliff_bridge::Bridge;
 use gliff_proto::{
     ClientMsg, OutputInfo as ProtoOutput, ServerMsg, SessionInfo, FEATURE_KEYBOARD_LOCKS,
     PROTOCOL_VERSION,
 };
+use gliff_transport::clipboard::progress::Jobs;
+use gliff_transport::clipboard::{self, outbound_channel, Transfers};
 use gliff_transport::Framed;
 use hypr_edge::{screen_on, Side};
-use hypr_input::{Axis as InAxis, Input, InputCmd, InputConfig, InputEvent};
+use hypr_input::{
+    Axis as InAxis, Clipboard, ClipboardEvent, Input, InputCmd, InputConfig, InputEvent,
+};
 use hypr_wl::Target;
 
-use crate::session::{handshake, now_ms, report_setup};
+use crate::notify;
+use crate::session::{handshake, now_ms, report_setup, spawn_reader, Inbound};
 
 pub async fn run<R, W>(rd: R, wr: W, target: Target, side: Side) -> Result<()>
 where
@@ -75,11 +84,63 @@ where
             features: vec![FEATURE_KEYBOARD_LOCKS.into()],
         })
         .await?;
+    let (clip_ev_tx, mut clip_ev_rx) = mpsc::unbounded_channel::<ClipboardEvent>();
+    let compositor = Clipboard::start(
+        target,
+        Box::new(move |ev| {
+            let _ = clip_ev_tx.send(ev);
+        }),
+    )
+    .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
+    .ok()
+    .map(Rc::new);
+    // What was copied here before the control started stays here: the
+    // client's own clipboard is not to be replaced by connecting.
+    while clip_ev_rx.try_recv().is_ok() {}
+    let (clip_out_tx, mut clip_out_rx) = outbound_channel();
+    let (report_tx, cancel_rx) = notify::start();
+    let jobs = Jobs::new(move |id, progress| {
+        let _ = report_tx.send((id, progress));
+    });
+    notify::forward_cancels(cancel_rx, jobs.clone());
+    let bridge = Bridge::new(
+        Transfers::new(clip_out_tx, clipboard::Side::Server),
+        jobs,
+        compositor,
+    );
+    let mut msg_rx = spawn_reader(reader);
+    let mut clip_open = true;
     loop {
-        let msg = match reader.read_msg::<ClientMsg>().await {
-            Ok(msg) => msg,
-            Err(gliff_transport::Error::Closed) => break,
-            Err(e) => return Err(e.into()),
+        let msg = tokio::select! {
+            msg = msg_rx.recv() => msg,
+            out = clip_out_rx.recv() => {
+                if let Some((msg, payload)) = out {
+                    let msg = ServerMsg::from(msg);
+                    if payload.is_empty() {
+                        writer.write_msg(&msg).await?;
+                    } else {
+                        writer.write_msg_with_payloads(&msg, &[&payload]).await?;
+                    }
+                }
+                continue;
+            }
+            // Disarmed once the sender is gone, or a closed channel would
+            // keep this arm always ready.
+            ev = clip_ev_rx.recv(), if clip_open => {
+                match ev {
+                    Some(ev) => bridge.on_compositor_event(ev),
+                    None => clip_open = false,
+                }
+                continue;
+            }
+        };
+        let msg = match msg {
+            Some(Inbound::Msg(msg)) => msg,
+            Some(Inbound::Clipboard(msg, payload)) => {
+                bridge.on_peer_msg(msg, payload);
+                continue;
+            }
+            None => break,
         };
         let cmd = match msg {
             ClientMsg::Key { keycode, pressed } => InputCmd::Key {

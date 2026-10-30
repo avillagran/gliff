@@ -226,8 +226,12 @@ gliff --control left:user@laptop --control right:user@desktop
 
 The other machine needs a `gliff-server` that knows `--control`; the pointer
 moves on its screen on the side facing this one. A machine that cannot be
-reached leaves its edge inactive until gliff connects to it again. The
-clipboard is not shared this way yet.
+reached leaves its edge inactive until gliff connects to it again.
+
+The clipboard is shared with each machine in both directions, and
+`--no-clipboard` turns that off. A copy made on one driven machine reaches
+this one, not another driven machine, and stops being available here if its
+machine drops.
 
 ## If something does not work
 

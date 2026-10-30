@@ -734,6 +734,7 @@ dependencies = [
  "clap",
  "dbus",
  "drm-fourcc",
+ "gliff-bridge",
  "gliff-proto",
  "gliff-sw",
  "gliff-transport",
@@ -753,6 +754,18 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "xkbcommon",
+]
+
+[[package]]
+name = "gliff-bridge"
+version = "0.4.1"
+dependencies = [
+ "bytes",
+ "gliff-proto",
+ "gliff-transport",
+ "hypr-input",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -798,6 +811,7 @@ dependencies = [
  "clap",
  "dbus",
  "drm-fourcc",
+ "gliff-bridge",
  "gliff-proto",
  "gliff-sw",
  "gliff-transport",

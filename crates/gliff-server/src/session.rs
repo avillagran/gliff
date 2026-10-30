@@ -3,6 +3,7 @@
 use std::ops::{ControlFlow, Deref, DerefMut};
 use std::os::fd::AsFd;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -11,6 +12,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use bytes::Bytes;
+use gliff_bridge::Bridge;
 use gliff_proto::clipboard::CHUNK;
 use gliff_proto::{
     features, version_mismatch, ChromaMode, ClientCaps, ClientMsg, ClipboardMsg, Codec, Greeting,
@@ -29,7 +31,6 @@ use hypr_capture::{CaptureConfig, CaptureEvent, CaptureMode, CapturedFrame, Capt
 use hypr_input::{Axis as InAxis, Clipboard, ClipboardEvent, Input, InputCmd, InputConfig};
 use hypr_wl::Target;
 
-use crate::clipboard::Bridge;
 use crate::notify;
 
 pub struct Config {
@@ -214,7 +215,8 @@ where
         }),
     )
     .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
-    .ok();
+    .ok()
+    .map(Rc::new);
     let (clip_out_tx, mut clip_out_rx) = outbound_channel();
     let (report_tx, cancel_rx) = notify::start();
     let jobs = Jobs::new(move |id, progress| {
@@ -391,7 +393,7 @@ where
 }
 
 /// What the reader task hands the session.
-enum Inbound {
+pub(crate) enum Inbound {
     Msg(ClientMsg),
     /// A clipboard message with the chunk that followed it (empty otherwise).
     Clipboard(ClipboardMsg, Bytes),
@@ -400,7 +402,7 @@ enum Inbound {
 /// Drain the socket on its own task so a burst of input (a mouse drag) can
 /// never starve frame capture and a blocked write can never block reads.
 /// Clipboard chunks are read here so the socket stays framed.
-fn spawn_reader<R>(mut reader: Framed<R>) -> UnboundedReceiver<Inbound>
+pub(crate) fn spawn_reader<R>(mut reader: Framed<R>) -> UnboundedReceiver<Inbound>
 where
     R: AsyncRead + Unpin + 'static,
 {
@@ -2271,7 +2273,6 @@ mod tests {
     #[test]
     fn served_output_ends_threads_before_the_output() {
         use std::cell::RefCell;
-        use std::rc::Rc;
 
         type Log = Rc<RefCell<Vec<&'static str>>>;
         struct Probe(&'static str, Log);
