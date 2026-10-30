@@ -693,6 +693,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "clap",
+ "dbus",
  "drm-fourcc",
  "gliff-proto",
  "gliff-sw",

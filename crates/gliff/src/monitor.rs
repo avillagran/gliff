@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::{self, Report};
 use crate::display::{Display, Target};
+use crate::tray::Tray;
 use crate::{App, Config};
 
 /// Where a machine's screen stands next to this computer's, per machine in
@@ -91,6 +92,9 @@ pub struct Controller {
     /// The machines driven from this computer's edges, by name.
     driven: RefCell<BTreeMap<String, Driven>>,
     next_id: Cell<u64>,
+    hide_button: gtk::Button,
+    /// The tray icon, while the window is hidden in it.
+    tray: RefCell<Option<Tray>>,
 }
 
 impl Controller {
@@ -99,6 +103,7 @@ impl Controller {
         button: &gtk::Button,
         settings: &gtk::Button,
         control_button: &gtk::Button,
+        hide_button: &gtk::Button,
     ) -> Rc<Self> {
         let this = Rc::new(Self {
             ui: Rc::downgrade(ui),
@@ -110,7 +115,11 @@ impl Controller {
             control_button: control_button.clone(),
             driven: RefCell::new(BTreeMap::new()),
             next_id: Cell::new(0),
+            hide_button: hide_button.clone(),
+            tray: RefCell::new(None),
         });
+        let c = this.clone();
+        hide_button.connect_clicked(move |_| c.hide_window());
         let c = this.clone();
         button.connect_clicked(move |_| {
             if c.running.borrow().is_some() {
@@ -233,8 +242,81 @@ impl Controller {
         }
     }
 
+    /// What runs with no use for the window: machines driven, a screen in
+    /// use. Empty when nothing does.
+    fn background(&self) -> Vec<String> {
+        let mut what: Vec<String> = self
+            .driven
+            .borrow()
+            .keys()
+            .map(|n| format!("controlling {n}"))
+            .collect();
+        if let Some((name, _)) = self.running.borrow().as_ref() {
+            what.push(format!("using {name}'s screen"));
+        }
+        what
+    }
+
+    /// Hide the window in the tray while something runs in the background.
+    /// Without a tray to bring it back from, the window stays.
+    fn hide_window(self: &Rc<Self>) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        let what = self.background();
+        if what.is_empty() || self.tray.borrow().is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        let tooltip = format!("Gliff is {}. Click to show it.", what.join(", "));
+        match Tray::show(tooltip, tx) {
+            Ok(tray) => *self.tray.borrow_mut() = Some(tray),
+            Err(e) => {
+                self.note(&format!(
+                    "Cannot hide the window: there is no tray in the bar to bring it back \
+                     from ({e})."
+                ));
+                return;
+            }
+        }
+        ui.window.set_visible(false);
+        let weak = Rc::downgrade(self);
+        glib::timeout_add_local(Duration::from_millis(150), move || {
+            let Some(c) = weak.upgrade() else {
+                return glib::ControlFlow::Break;
+            };
+            if c.tray.borrow().is_none() {
+                return glib::ControlFlow::Break;
+            }
+            if rx.try_recv().is_ok() {
+                c.show_window();
+                return glib::ControlFlow::Break;
+            }
+            glib::ControlFlow::Continue
+        });
+    }
+
+    /// Bring a hidden window back and take its tray icon away.
+    fn show_window(&self) {
+        let tray = self.tray.borrow_mut().take();
+        if tray.is_none() {
+            return;
+        }
+        drop(tray);
+        if let Some(ui) = self.ui.upgrade() {
+            ui.window.set_visible(true);
+            ui.window.present();
+        }
+    }
+
     /// Set the control button for the selected machine.
     pub fn update_control_button(&self) {
+        let background = !self.background().is_empty();
+        self.hide_button.set_visible(background);
+        // Nothing left to run hidden: show what ended.
+        if !background {
+            self.show_window();
+        }
         let selected = self.selected();
         let driving = selected.as_deref().is_some_and(|n| self.drives(n));
         self.control_button.set_icon_name(if driving {
