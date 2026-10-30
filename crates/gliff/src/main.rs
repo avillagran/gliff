@@ -15,7 +15,9 @@ mod net;
 mod paintable;
 mod recent;
 mod remote_install;
+mod sound;
 mod theme;
+mod tray;
 
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
@@ -447,11 +449,22 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     let control_btn = gtk::Button::builder()
         .icon_name("input-mouse-symbolic")
         .build();
+    let sound_btn = gtk::ToggleButton::builder()
+        .icon_name("audio-volume-muted-symbolic")
+        .visible(false)
+        .build();
+    let hide_btn = gtk::Button::builder()
+        .icon_name("go-bottom-symbolic")
+        .tooltip_text("Hide this window in the bar while it works in the background")
+        .visible(false)
+        .build();
     // A --stdio window is itself the other machine's screen.
     if !cli.stdio {
         header.pack_end(&monitor_btn);
+        header.pack_end(&sound_btn);
         header.pack_end(&control_btn);
         header.pack_end(&monitor_settings_btn);
+        header.pack_end(&hide_btn);
     }
 
     let stats = gtk::Label::builder()
@@ -556,6 +569,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         &monitor_btn,
         &monitor_settings_btn,
         &control_btn,
+        &hide_btn,
+        &sound_btn,
     ));
     refresh_tabs(&ui);
 
