@@ -23,6 +23,12 @@ const RETRY_FIRST: Duration = Duration::from_secs(1);
 const RETRY_MAX: Duration = Duration::from_secs(30);
 /// A link that stayed up this long retries from the first delay again.
 const STABLE: Duration = Duration::from_secs(10);
+/// How often a link asks the other machine whether it is there.
+const KEEPALIVE: Duration = Duration::from_secs(2);
+/// A link that hears nothing for this long, or cannot write for this long,
+/// is dropped, so its edge stops taking the pointer to a machine that is
+/// gone without closing the connection.
+const SILENCE: Duration = Duration::from_secs(6);
 
 /// One `--control` argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -605,30 +611,57 @@ async fn session(
         extent: Some(extent),
     });
     let mut keymap_alive = true;
+    let mut heard = Instant::now();
+    let mut keepalive = tokio::time::interval(KEEPALIVE);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             msg = out.recv() => match msg {
                 Some(ClientMsg::KeyboardLocks { .. }) if !takes_locks => {}
-                Some(msg) => writer.write_msg(&msg).await?,
+                Some(msg) => write(&mut writer, &msg).await?,
                 None => return Ok(()),
             },
             changed = keymap.changed(), if keymap_alive => match changed {
                 Ok(()) => {
                     let text = keymap.borrow_and_update().clone();
                     if !text.is_empty() {
-                        writer.write_msg(&ClientMsg::Keymap { keymap: text }).await?;
+                        write(&mut writer, &ClientMsg::Keymap { keymap: text }).await?;
                     }
                 }
                 Err(_) => keymap_alive = false,
             },
-            read = reader.read_msg::<ServerMsg>() => match read {
-                Ok(ServerMsg::Ping { t }) => writer.write_msg(&ClientMsg::Pong { t }).await?,
-                Ok(_) => {}
-                Err(gliff_transport::Error::Closed) => return Ok(()),
-                Err(e) => return Err(e.into()),
-            },
+            read = reader.read_msg::<ServerMsg>() => {
+                heard = Instant::now();
+                match read {
+                    Ok(ServerMsg::Ping { t }) => write(&mut writer, &ClientMsg::Pong { t }).await?,
+                    Ok(_) => {}
+                    Err(gliff_transport::Error::Closed) => return Ok(()),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            _ = keepalive.tick() => {
+                anyhow::ensure!(
+                    heard.elapsed() < SILENCE,
+                    "the other machine stopped answering"
+                );
+                let t = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as u64);
+                write(&mut writer, &ClientMsg::Ping { t }).await?;
+            }
         }
     }
+}
+
+/// Write `msg`, giving up on a link that takes longer than [`SILENCE`].
+async fn write<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut Framed<W>,
+    msg: &ClientMsg,
+) -> anyhow::Result<()> {
+    tokio::time::timeout(SILENCE, writer.write_msg(msg))
+        .await
+        .map_err(|_| anyhow::anyhow!("the other machine stopped taking input"))??;
+    Ok(())
 }
 
 #[cfg(test)]
