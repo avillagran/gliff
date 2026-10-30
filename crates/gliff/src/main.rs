@@ -7,6 +7,7 @@
 
 mod clipboard;
 mod clipboard_ui;
+mod control;
 mod display;
 mod keymap;
 mod monitor;
@@ -87,7 +88,8 @@ struct Cli {
     /// the local compositor. Forms: a chord like `shift+escape`, `ctrl+alt+q`
     /// or `super+escape`; `double-<key>` for a double-tap (e.g.
     /// `double-escape`); or `none` to disable. The screen recaptures when you
-    /// click it again.
+    /// click it again. With `--control` it returns the pointer, and takes a
+    /// chord or `none`.
     #[arg(long, default_value = "shift+escape")]
     release_hotkey: String,
     /// Video pipeline: `gpu` (Vulkan compute + VA-API, falling back to the
@@ -95,6 +97,13 @@ struct Cli {
     /// the GLIFF_VIDEO environment variable.
     #[arg(long, value_parser = ["gpu", "cpu"])]
     video: Option<String>,
+    /// Drive another machine with this pointer and keyboard, with no window:
+    /// `SIDE:HOST`, where SIDE (`left`, `right`, `above` or `below`) is where
+    /// it sits beside this machine's screens. Push the pointer past that edge
+    /// to move onto it; cross back, or press the release hotkey, to return.
+    /// Repeat it for a machine on each side.
+    #[arg(long, value_parser = control::parse, conflicts_with_all = ["host", "connect", "headless", "output", "stdio"])]
+    control: Vec<control::Control>,
 }
 
 /// Everything the UI shares with its callbacks.
@@ -241,6 +250,19 @@ impl Session {
 
 fn main() -> glib::ExitCode {
     let cli = Cli::parse();
+    if !cli.control.is_empty() {
+        // With no window, the log is how it says what it is doing.
+        let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        tracing_subscriber::fmt().with_env_filter(filter).init();
+        return match control::run(&cli.control, &cli.server_bin, &cli.release_hotkey) {
+            Ok(()) => glib::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("gliff: {e:#}");
+                glib::ExitCode::FAILURE
+            }
+        };
+    }
     // Before anything can print or start a thread: with --stdio, stdout
     // carries the protocol, and ssh started us outside the desktop session.
     if cli.stdio {
