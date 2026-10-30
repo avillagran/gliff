@@ -317,11 +317,15 @@ impl Controller {
             if c.tray.borrow().is_none() {
                 return glib::ControlFlow::Break;
             }
-            if rx.try_recv().is_ok() {
-                c.show_window();
-                return glib::ControlFlow::Break;
+            match rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                // A click, or the icon gone with its thread: without the
+                // icon, the window is the only way to stop what runs.
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                    c.show_window();
+                    glib::ControlFlow::Break
+                }
             }
-            glib::ControlFlow::Continue
         });
     }
 
