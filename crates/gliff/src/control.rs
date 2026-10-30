@@ -88,14 +88,21 @@ impl Hotkey {
     }
 
     /// Whether pressing `code` (evdev) with the modifiers of `keys` is this
-    /// chord.
+    /// chord. The key may name the symbol without modifiers (`shift+escape`)
+    /// or the one they produce (`shift+exclam`).
     fn matches(&self, keys: &xkb::State, code: u32) -> bool {
         let key = xkb::Keycode::new(code + 8);
         let layout = keys.key_get_layout(key);
-        keys.get_keymap()
+        let unmodified = keys
+            .get_keymap()
             .key_get_syms_by_level(key, layout, 0)
             .iter()
-            .any(|s| s.raw() == self.keysym)
+            .any(|s| s.raw() == self.keysym);
+        let produced = keys
+            .key_get_syms(key)
+            .iter()
+            .any(|s| s.raw() == self.keysym);
+        (unmodified || produced)
             && self
                 .mods
                 .iter()
@@ -695,6 +702,14 @@ mod tests {
         press(&mut us, RIGHT_SHIFT);
         assert!(hk.matches(&us, ESC));
         assert!(!hk.matches(&us, Q));
+
+        // A shifted symbol: on US, shift+1 types !.
+        const ONE: u32 = 2;
+        let hk = Hotkey::parse("shift+exclam").unwrap().unwrap();
+        let mut us = state("us", "");
+        assert!(!hk.matches(&us, ONE), "1 alone");
+        press(&mut us, LEFT_SHIFT);
+        assert!(hk.matches(&us, ONE));
 
         // On Dvorak the key that types q is where QWERTY has x.
         let hk = Hotkey::parse("Ctrl+Alt+q").unwrap().unwrap();
