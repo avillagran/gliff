@@ -16,9 +16,13 @@
 > | [omacom/gliff#101](https://github.com/omacom/gliff/pull/101) | `gliff --stdio` and `--fullscreen`: show a server whose stream arrives on stdin and stdout |
 > | [omacom/gliff#102](https://github.com/omacom/gliff/pull/102) | `gliff-server --position` and `--align`: place a headless output beside the other screens |
 > | [omacom/gliff#103](https://github.com/omacom/gliff/pull/103) | Use another machine's screen as one more screen of this one |
+> | [omacom/gliff#104](https://github.com/omacom/gliff/pull/104) | Decodes on the CPU when the GPU decodes nothing (NVIDIA's VA-API) |
+> | [omacom/gliff#105](https://github.com/omacom/gliff/pull/105) | `gliff --control`: one mouse and keyboard for several machines, across screen edges |
+> | [omacom/gliff#106](https://github.com/omacom/gliff/pull/106) | Control the selected machine from the window, hide it in the tray, and hear that machine here |
 >
-> Planned here, not sent to gliff: other protocols besides gliff's own,
-> starting with VNC, RDP and RustDesk.
+> Only here, not sent to gliff yet: `gliff-server --vnc`, which serves a
+> screen to VNC viewers ([docs/vnc.md](docs/vnc.md)). Planned: RDP and
+> RustDesk.
 >
 > To install this fork instead of the gliff package, on each machine:
 >
