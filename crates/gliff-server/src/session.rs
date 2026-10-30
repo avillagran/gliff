@@ -633,6 +633,8 @@ impl Session {
                 self.inject(InputCmd::SetKeymap(keymap))
             }
             ClientMsg::Keymap { .. } => {}
+            // Only `--control` lists the feature that sends it.
+            ClientMsg::KeyboardLocks { .. } => {}
             ClientMsg::Hello { .. } => anyhow::bail!("unexpected second Hello"),
         }
         Ok(ControlFlow::Continue(()))
