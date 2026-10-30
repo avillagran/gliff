@@ -19,6 +19,7 @@
 > | [omacom/gliff#104](https://github.com/omacom/gliff/pull/104) | Decodes on the CPU when the GPU decodes nothing (NVIDIA's VA-API) |
 > | [omacom/gliff#105](https://github.com/omacom/gliff/pull/105) | `gliff --control`: one mouse and keyboard for several machines, across screen edges |
 > | [omacom/gliff#106](https://github.com/omacom/gliff/pull/106) | Control the selected machine from the window, hide it in the tray, and hear that machine here |
+> | [omacom/gliff#108](https://github.com/omacom/gliff/pull/108) | Offers this computer's `gliff-server` to a machine too old to be controlled |
 >
 > Only here, not sent to gliff yet: `gliff-server --vnc`, which serves a
 > screen to VNC viewers ([docs/vnc.md](docs/vnc.md)). Planned: RDP and
@@ -45,6 +46,31 @@
 > one. The other machine needs gliff too. This fork's gliff there takes the
 > stream itself (`gliff --stdio`); gliff 0.4.1 or older still works,
 > through a relay that Hyprland makes fullscreen.
+>
+> ![Choosing the side of the other machine's screen](.github/assets/screenshots/screen-settings.png)
+>
+> ![A headless output beside this machine's screen](.github/assets/screenshots/screen-placement.png)
+>
+> ![The window while the other machine's screen is in use](.github/assets/screenshots/screen-in-use.png)
+>
+> **One mouse for several machines.** Select a machine's tab and press the
+> mouse button in the title bar. The first time, it asks on which side that
+> machine stands. Push the pointer past that edge and your keyboard follows
+> it; cross back to return. The speaker button brings that machine's sound
+> here, and the hide button leaves an icon in the tray.
+>
+> ![Choosing the side of the machine to control](.github/assets/screenshots/control-settings.png)
+>
+> ![Controlling the selected machine](.github/assets/screenshots/control-driving.png)
+>
+> ![The tray icon, second from the left](.github/assets/screenshots/control-tray.png)
+>
+> If that machine's `gliff-server` is too old for this, gliff says so and
+> offers to install this computer's server for your user, in `~/.local/bin`.
+> For another architecture, such as an aarch64 laptop and an x86_64 desktop,
+> keep a server for it at `~/.local/share/gliff/servers/<arch>/gliff-server`.
+>
+> ![The prompt for a machine too old to control](.github/assets/screenshots/update-prompt.png)
 
 gliff is a remote desktop for Hyprland. It shows the Hyprland session of
 another machine in a window on yours, and all it needs between the two is
