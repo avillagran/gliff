@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::{self, Report};
 use crate::display::{Display, Target};
+use crate::sound::Sound;
 use crate::tray::Tray;
 use crate::{App, Config};
 
@@ -28,6 +29,8 @@ pub struct Settings {
     pub side: String,
     /// `start`, `center` or `end`: which edges line up along that side.
     pub alignment: String,
+    /// While driven from here, its sound plays here.
+    pub sound: bool,
 }
 
 impl Default for Settings {
@@ -35,6 +38,7 @@ impl Default for Settings {
         Self {
             side: "right".into(),
             alignment: "start".into(),
+            sound: false,
         }
     }
 }
@@ -75,6 +79,8 @@ struct Driven {
     side: String,
     handle: control::Handle,
     connected: bool,
+    /// Its sound, while it plays here.
+    sound: Option<Rc<RefCell<Option<Sound>>>>,
 }
 
 pub struct Controller {
@@ -95,6 +101,10 @@ pub struct Controller {
     hide_button: gtk::Button,
     /// The tray icon, while the window is hidden in it.
     tray: RefCell<Option<Tray>>,
+    sound_button: gtk::ToggleButton,
+    /// Set while the code moves the sound button, so its handler only acts
+    /// on the user's clicks.
+    syncing: Cell<bool>,
 }
 
 impl Controller {
@@ -104,6 +114,7 @@ impl Controller {
         settings: &gtk::Button,
         control_button: &gtk::Button,
         hide_button: &gtk::Button,
+        sound_button: &gtk::ToggleButton,
     ) -> Rc<Self> {
         let this = Rc::new(Self {
             ui: Rc::downgrade(ui),
@@ -117,6 +128,23 @@ impl Controller {
             next_id: Cell::new(0),
             hide_button: hide_button.clone(),
             tray: RefCell::new(None),
+            sound_button: sound_button.clone(),
+            syncing: Cell::new(false),
+        });
+        let c = this.clone();
+        sound_button.connect_toggled(move |b| {
+            if c.syncing.get() {
+                return;
+            }
+            let Some(name) = c.selected().filter(|n| c.drives(n)) else {
+                return;
+            };
+            if b.is_active() {
+                c.start_sound(&name);
+            } else {
+                c.stop_sound(&name);
+            }
+            c.remember_sound(&name, b.is_active());
         });
         let c = this.clone();
         hide_button.connect_clicked(move |_| c.hide_window());
@@ -309,6 +337,64 @@ impl Controller {
         }
     }
 
+    /// Play `name`'s sound here while it is driven.
+    fn start_sound(self: &Rc<Self>, name: &str) {
+        let playing = self.driven.borrow().get(name).map(|d| d.sound.is_some());
+        if playing != Some(false) {
+            return;
+        }
+        let weak = Rc::downgrade(self);
+        let ended_name = name.to_string();
+        let started = Sound::start(name, move |why| {
+            let Some(c) = weak.upgrade() else {
+                return;
+            };
+            if let Some(d) = c.driven.borrow_mut().get_mut(&ended_name) {
+                d.sound = None;
+            }
+            if let Some(why) = why {
+                c.note(&format!("No sound from {ended_name}: {why}"));
+            }
+            c.update_control_button();
+        });
+        match started {
+            Ok(sound) => {
+                if let Some(d) = self.driven.borrow_mut().get_mut(name) {
+                    d.sound = Some(sound);
+                }
+            }
+            Err(e) => self.note(&format!("Cannot play {name}'s sound here: {e}")),
+        }
+        self.update_control_button();
+    }
+
+    fn stop_sound(&self, name: &str) {
+        let sound = self
+            .driven
+            .borrow_mut()
+            .get_mut(name)
+            .and_then(|d| d.sound.take());
+        if let Some(sound) = sound {
+            sound.borrow_mut().take();
+        }
+        self.update_control_button();
+    }
+
+    /// Keep whether `name`'s sound plays here for the next time.
+    fn remember_sound(&self, name: &str, on: bool) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
+        let mut config = Config::load(&ui.config_path);
+        let Some(settings) = config.monitors.get_mut(name) else {
+            return;
+        };
+        settings.sound = on;
+        if let Err(e) = config.save(&ui.config_path) {
+            self.note(&format!("Cannot save the sound setting: {e}"));
+        }
+    }
+
     /// Set the control button for the selected machine.
     pub fn update_control_button(&self) {
         let background = !self.background().is_empty();
@@ -319,6 +405,26 @@ impl Controller {
         }
         let selected = self.selected();
         let driving = selected.as_deref().is_some_and(|n| self.drives(n));
+        let playing = selected
+            .as_deref()
+            .and_then(|n| self.driven.borrow().get(n).map(|d| d.sound.is_some()))
+            .unwrap_or(false);
+        self.syncing.set(true);
+        self.sound_button.set_visible(driving);
+        self.sound_button.set_active(playing);
+        self.syncing.set(false);
+        self.sound_button.set_icon_name(if playing {
+            "audio-volume-high-symbolic"
+        } else {
+            "audio-volume-muted-symbolic"
+        });
+        if let Some(name) = &selected {
+            self.sound_button.set_tooltip_text(Some(&if playing {
+                format!("{name}'s sound plays here. Click to play it there again.")
+            } else {
+                format!("Play {name}'s sound here instead of on its own speakers")
+            }));
+        }
         self.control_button.set_icon_name(if driving {
             crate::STOP_ICON
         } else {
@@ -439,6 +545,7 @@ impl Controller {
                     .map_or("right", |(s, _)| *s)
                     .into(),
                 alignment: ALIGNMENTS[(align.selected() as usize).min(2)].0.into(),
+                sound: saved.sound,
             };
             let mut config = Config::load(&ui.config_path);
             config.monitors.insert(name.clone(), settings.clone());
@@ -551,8 +658,12 @@ impl Controller {
                 side: settings.side.clone(),
                 handle,
                 connected: false,
+                sound: None,
             },
         );
+        if settings.sound {
+            self.start_sound(&name);
+        }
         // Showing that machine here as well would only take the pointer
         // away from its edge.
         crate::show_controlling(&ui, &name);
@@ -624,7 +735,11 @@ impl Controller {
             return;
         };
         driven.handle.stop();
-        std::thread::spawn(move || drop(driven));
+        if let Some(sound) = driven.sound.take() {
+            sound.borrow_mut().take();
+        }
+        let handle = driven.handle;
+        std::thread::spawn(move || drop(handle));
         self.note(&format!("Stopped controlling {name}."));
         self.refresh();
     }
