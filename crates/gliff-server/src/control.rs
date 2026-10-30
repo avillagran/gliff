@@ -6,7 +6,10 @@
 use anyhow::{Context, Result};
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use gliff_proto::{ClientMsg, OutputInfo as ProtoOutput, ServerMsg, SessionInfo, PROTOCOL_VERSION};
+use gliff_proto::{
+    ClientMsg, OutputInfo as ProtoOutput, ServerMsg, SessionInfo, FEATURE_KEYBOARD_LOCKS,
+    PROTOCOL_VERSION,
+};
 use gliff_transport::Framed;
 use hypr_edge::{screen_on, Side};
 use hypr_input::{Axis as InAxis, Input, InputCmd, InputConfig, InputEvent};
@@ -69,7 +72,7 @@ where
                 height: mode_height,
                 scale_milli: (monitor.scale * 1000.0).round() as u32,
             }],
-            features: Vec::new(),
+            features: vec![FEATURE_KEYBOARD_LOCKS.into()],
         })
         .await?;
     loop {
@@ -100,6 +103,7 @@ where
                 stop,
             },
             ClientMsg::Keymap { keymap } if !keymap.is_empty() => InputCmd::SetKeymap(keymap),
+            ClientMsg::KeyboardLocks { layout, locked } => InputCmd::SetLocks { layout, locked },
             ClientMsg::Ping { t } => {
                 writer
                     .write_msg(&ServerMsg::Pong {
