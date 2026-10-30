@@ -49,6 +49,13 @@ where
     .await?;
     input.send(InputCmd::SetExtent { width, height })?;
     tracing::info!(output = %monitor.name, width, height, side = side.name(), "controlled from that side");
+    // The client works out the extent from these, so a rotated screen
+    // names its size as it stands, the way `SetExtent` has it.
+    let (mode_width, mode_height) = if monitor.transform % 2 == 1 {
+        (monitor.height, monitor.width)
+    } else {
+        (monitor.width, monitor.height)
+    };
     writer
         .write_msg(&ServerMsg::HelloAck {
             version: PROTOCOL_VERSION,
@@ -58,8 +65,8 @@ where
             },
             outputs: vec![ProtoOutput {
                 name: monitor.name.clone(),
-                width: monitor.width,
-                height: monitor.height,
+                width: mode_width,
+                height: mode_height,
                 scale_milli: (monitor.scale * 1000.0).round() as u32,
             }],
             features: Vec::new(),
