@@ -4,7 +4,7 @@
 //! edge ([`control`](crate::control)), and stop either again.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::rc::{Rc, Weak};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::control::{self, Report};
 use crate::display::{Display, Target};
+use crate::remote_install::{self, Outcome};
 use crate::sound::Sound;
 use crate::tray::Tray;
 use crate::{App, Config};
@@ -99,6 +100,8 @@ pub struct Controller {
     /// The machines driven from this computer's edges, by name.
     driven: RefCell<BTreeMap<String, Driven>>,
     next_id: Cell<u64>,
+    /// Machines being checked, or updated, before they are driven.
+    checking: RefCell<BTreeSet<String>>,
     hide_button: gtk::Button,
     /// The tray icon, while the window is hidden in it.
     tray: RefCell<Option<Tray>>,
@@ -127,6 +130,7 @@ impl Controller {
             control_button: control_button.clone(),
             driven: RefCell::new(BTreeMap::new()),
             next_id: Cell::new(0),
+            checking: RefCell::default(),
             hide_button: hide_button.clone(),
             tray: RefCell::new(None),
             sound_button: sound_button.clone(),
@@ -615,15 +619,13 @@ impl Controller {
     }
 
     /// Drive `name` from the edge on `settings.side`, until stopped.
-    fn start_control(self: &Rc<Self>, name: String, settings: &Settings) {
-        let Some(ui) = self.ui.upgrade() else {
-            return;
-        };
-        if self.owns(&name) {
+    /// Why `name` cannot be driven with `settings` now, already shown.
+    fn control_refused(&self, name: &str, settings: &Settings) -> bool {
+        if self.owns(name) {
             self.note(&format!(
                 "{name}'s screen is in use as a screen of this computer. Stop that first."
             ));
-            return;
+            return true;
         }
         let taken = self
             .driven
@@ -637,8 +639,66 @@ impl Controller {
                  on another side.",
                 settings.side
             ));
+            return true;
+        }
+        false
+    }
+
+    /// Drive `name`, once its gliff-server can be, offering to update it
+    /// when it is too old: left to fail, it would only retry for ever.
+    fn start_control(self: &Rc<Self>, name: String, settings: &Settings) {
+        if self.control_refused(&name, settings) || !self.checking.borrow_mut().insert(name.clone())
+        {
             return;
         }
+        self.note(&format!("Checking {name}…"));
+        let settings = settings.clone();
+        let c = self.clone();
+        glib::spawn_future_local(async move {
+            let ready = c.server_ready(&name).await;
+            c.checking.borrow_mut().remove(&name);
+            if ready && !c.control_refused(&name, &settings) {
+                c.drive(name, &settings);
+            }
+        });
+    }
+
+    /// Whether `name` can be driven, after updating it if the user agrees.
+    /// A machine that does not answer counts: connecting says why it failed.
+    async fn server_ready(&self, name: &str) -> bool {
+        let Some(ui) = self.ui.upgrade() else {
+            return false;
+        };
+        let server_bin = ui.cli.server_bin.clone();
+        if remote_install::supports_control(name, &server_bin).await != Some(false) {
+            return true;
+        }
+        if !remote_install::confirm_update(&ui.window, name).await {
+            self.note(&format!(
+                "{name} needs a newer gliff-server to be controlled."
+            ));
+            return false;
+        }
+        self.note(&format!("Installing gliff-server on {name}…"));
+        if let Outcome::Failed(why) = remote_install::update_server(name).await {
+            self.note(&format!("Could not install gliff-server: {why}"));
+            return false;
+        }
+        // Another one may come first on that machine's PATH.
+        if remote_install::supports_control(name, &server_bin).await == Some(false) {
+            self.note(&format!(
+                "{name} still runs an older gliff-server, which comes first on its PATH \
+                 over ssh."
+            ));
+            return false;
+        }
+        true
+    }
+
+    fn drive(self: &Rc<Self>, name: String, settings: &Settings) {
+        let Some(ui) = self.ui.upgrade() else {
+            return;
+        };
         let Some(side) = hypr_edge::Side::parse(&settings.side) else {
             return;
         };
