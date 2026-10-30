@@ -51,6 +51,57 @@ const MAX_CURSOR: u32 = 1024;
 /// so every frame fails and the screen stays black.
 const GPU_FAILURES_BEFORE_CPU: u32 = 3;
 
+/// Whether a session gives up on a GPU that decodes nothing, and the frames
+/// to skip once it has.
+#[derive(Debug)]
+struct GpuFallback {
+    /// GPU decode errors so far, while the GPU has decoded nothing yet;
+    /// `None` once it has, which proves it works, or once it was given up.
+    failures: Option<u32>,
+    /// Set when the decoder was replaced mid-stream: frames that depend on
+    /// pictures the new one never saw are skipped until a keyframe.
+    await_keyframe: bool,
+}
+
+impl GpuFallback {
+    fn new() -> Self {
+        Self {
+            failures: Some(0),
+            await_keyframe: false,
+        }
+    }
+
+    /// The GPU decoded a picture: it works, and errors no longer count.
+    fn gpu_decoded(&mut self) {
+        self.failures = None;
+    }
+
+    /// The GPU failed to decode a frame. True when the session should now
+    /// decode on the CPU; it then skips frames until a keyframe.
+    fn gpu_failed(&mut self) -> bool {
+        let Some(n) = self.failures.as_mut() else {
+            return false;
+        };
+        *n += 1;
+        if *n < GPU_FAILURES_BEFORE_CPU {
+            return false;
+        }
+        self.failures = None;
+        self.await_keyframe = true;
+        true
+    }
+
+    /// Whether a frame must be skipped, unseen by the decoder. A keyframe
+    /// ends the wait.
+    fn skip(&mut self, keyframe: bool) -> bool {
+        if self.await_keyframe && !keyframe {
+            return true;
+        }
+        self.await_keyframe = false;
+        false
+    }
+}
+
 /// A decoded frame with the geometry it was configured under, so the UI
 /// never paints a frame with another configuration's view or scale (frames
 /// and statuses travel on separate channels).
@@ -555,12 +606,7 @@ where
     let ((width, height), scale_milli) = (cfg.stream, cfg.scale_milli);
     tracing::info!(width, height, scale_milli, decode_on, video = %video_label, "connected");
     let mut logged_first = false;
-    // GPU decode errors since the session started, while the GPU has
-    // decoded nothing yet; `None` once it has, which proves it works.
-    let mut gpu_failures = Some(0);
-    // Set when the decoder was replaced mid-stream: frames that depend on
-    // pictures it never saw are skipped until the keyframe asked for.
-    let mut await_keyframe = false;
+    let mut fallback = GpuFallback::new();
 
     // Writes run on their own task, fed by `out_tx`, so reads (draining video)
     // never block on a write and the two peers cannot deadlock. Both the reader
@@ -780,7 +826,7 @@ where
                 };
                 bytes_since += (data_len + aux_len) as u64;
                 drain_at = tokio::time::Instant::now() + IDLE_DRAIN;
-                if await_keyframe && !keyframe {
+                if fallback.skip(keyframe) {
                     let _ = out_tx.send((
                         ClientMsg::FrameAck {
                             frame_id,
@@ -790,7 +836,6 @@ where
                     ));
                     continue;
                 }
-                await_keyframe = false;
                 in_decoder.push_back(cfg.geometry());
                 let t0 = std::time::Instant::now();
                 let decoded = match &mut decoder {
@@ -823,7 +868,7 @@ where
                             logged_first = true;
                         }
                         if matches!(frame, Frame::Dmabuf(_)) {
-                            gpu_failures = None;
+                            fallback.gpu_decoded();
                         }
                         // Latest-wins: a frame the full UI channel rejects
                         // waits in `undelivered` (superseding any drained
@@ -866,30 +911,24 @@ where
                         tracing::warn!(error = %e, "decode error; requesting keyframe");
                         in_decoder.clear();
                         let _ = out_tx.send((ClientMsg::RequestKeyframe, Bytes::new()));
-                        if matches!(decoder, VideoDecoder::Gpu(_)) {
-                            if let Some(n) = gpu_failures.as_mut() {
-                                *n += 1;
-                                if *n >= GPU_FAILURES_BEFORE_CPU {
-                                    tracing::warn!(
-                                        failures = *n,
-                                        "the GPU decodes no frame; falling back to the CPU pipeline"
-                                    );
-                                    gpu = None;
-                                    let (width, height) = cfg.stream;
-                                    decoder = new_decoder(&gpu, cfg.chroma, width, height)?;
-                                    last_gpu_geometry = None;
-                                    undelivered = None;
-                                    await_keyframe = true;
-                                    video_label = tier_label(pipeline, &decoder);
-                                    let _ = status.send(Status::Connected {
-                                        video: video_label.clone(),
-                                        view_width: cfg.view.0,
-                                        view_height: cfg.view.1,
-                                        fps_cap: cfg.fps_cap,
-                                        headless,
-                                    });
-                                }
-                            }
+                        if matches!(decoder, VideoDecoder::Gpu(_)) && fallback.gpu_failed() {
+                            tracing::warn!(
+                                failures = GPU_FAILURES_BEFORE_CPU,
+                                "the GPU decodes no frame; falling back to the CPU pipeline"
+                            );
+                            gpu = None;
+                            let (width, height) = cfg.stream;
+                            decoder = new_decoder(&gpu, cfg.chroma, width, height)?;
+                            last_gpu_geometry = None;
+                            undelivered = None;
+                            video_label = tier_label(pipeline, &decoder);
+                            let _ = status.send(Status::Connected {
+                                video: video_label.clone(),
+                                view_width: cfg.view.0,
+                                view_height: cfg.view.1,
+                                fps_cap: cfg.fps_cap,
+                                headless,
+                            });
                         }
                     }
                 }
@@ -1046,6 +1085,38 @@ fn cursor_payload_fits(width: u32, height: u32, argb_len: u32) -> bool {
 #[cfg(test)]
 mod stream_tests {
     use super::*;
+
+    #[test]
+    fn three_gpu_errors_before_a_picture_fall_back_to_the_cpu() {
+        let mut f = GpuFallback::new();
+        assert!(!f.gpu_failed());
+        assert!(!f.gpu_failed());
+        assert!(f.gpu_failed());
+        // Once given up, the GPU is not given up again.
+        assert!(!f.gpu_failed());
+    }
+
+    #[test]
+    fn a_gpu_picture_keeps_the_gpu_through_later_errors() {
+        let mut f = GpuFallback::new();
+        assert!(!f.gpu_failed());
+        f.gpu_decoded();
+        for _ in 0..10 {
+            assert!(!f.gpu_failed());
+        }
+        assert!(!f.skip(false));
+    }
+
+    #[test]
+    fn after_falling_back_frames_are_skipped_until_a_keyframe() {
+        let mut f = GpuFallback::new();
+        assert!(!f.skip(false), "nothing is skipped before a fallback");
+        while !f.gpu_failed() {}
+        assert!(f.skip(false));
+        assert!(f.skip(false));
+        assert!(!f.skip(true));
+        assert!(!f.skip(false), "frames after the keyframe are decoded");
+    }
     #[test]
     fn reject_invalid_stream_geometry_before_creating_a_decoder() {
         for size in [
