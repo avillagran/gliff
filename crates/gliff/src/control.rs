@@ -726,6 +726,10 @@ async fn session(
         error: None,
     });
     let mut keymap_alive = true;
+    // The last layout and locks written. Keymaps and locks reach this loop by
+    // separate ways, so the locks are written again after each keymap: a
+    // layout the old keymap lacked would otherwise have been dropped.
+    let mut locks: Option<ClientMsg> = None;
     let mut heard = Instant::now();
     let mut keepalive = tokio::time::interval(KEEPALIVE);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -733,6 +737,10 @@ async fn session(
         tokio::select! {
             msg = out.recv() => match msg {
                 Some(ClientMsg::KeyboardLocks { .. }) if !takes_locks => {}
+                Some(msg @ ClientMsg::KeyboardLocks { .. }) => {
+                    write(&mut writer, &msg).await?;
+                    locks = Some(msg);
+                }
                 Some(msg) => write(&mut writer, &msg).await?,
                 None => return Ok(()),
             },
@@ -741,6 +749,9 @@ async fn session(
                     let text = keymap.borrow_and_update().clone();
                     if !text.is_empty() {
                         write(&mut writer, &ClientMsg::Keymap { keymap: text }).await?;
+                        if let Some(locks) = &locks {
+                            write(&mut writer, locks).await?;
+                        }
                     }
                 }
                 Err(_) => keymap_alive = false,
