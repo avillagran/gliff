@@ -257,7 +257,12 @@ fn main() -> glib::ExitCode {
         let filter = tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
         tracing_subscriber::fmt().with_env_filter(filter).init();
-        return match control::run(&cli.control, &cli.server_bin, &cli.release_hotkey) {
+        return match control::run(
+            &cli.control,
+            &cli.server_bin,
+            &cli.release_hotkey,
+            !cli.no_clipboard,
+        ) {
             Ok(()) => glib::ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("gliff: {e:#}");

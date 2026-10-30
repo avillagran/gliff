@@ -3,14 +3,24 @@
 //! pointer past that edge carries it onto the other machine's screen; moving
 //! it back across the facing edge, or the release hotkey, returns it.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use gliff_proto::{ClientCaps, ClientMsg, ServerMsg, FEATURE_KEYBOARD_LOCKS, PROTOCOL_VERSION};
+use bytes::Bytes;
+use gliff_bridge::Bridge;
+use gliff_proto::clipboard::CHUNK;
+use gliff_proto::{
+    ClientCaps, ClientMsg, ClipboardMsg, ServerMsg, FEATURE_KEYBOARD_LOCKS, PROTOCOL_VERSION,
+};
+use gliff_transport::clipboard::progress::Jobs;
+use gliff_transport::clipboard::{self, outbound_channel, Transfers};
 use gliff_transport::Framed;
 use gliff_transport::{spawn_ssh, SshStream, SshTarget};
 use hypr_edge::{EdgeCmd, EdgeConfig, EdgeEvent, Edges, Side};
+use hypr_input::{Clipboard, ClipboardEvent};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 use xkbcommon::xkb;
@@ -172,6 +182,7 @@ impl Handle {
         controls: Vec<Control>,
         server_bin: String,
         hotkey: String,
+        share_clipboard: bool,
         report: std::sync::mpsc::Sender<Report>,
     ) -> std::io::Result<Self> {
         let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
@@ -183,6 +194,7 @@ impl Handle {
                     &controls,
                     &server_bin,
                     &hotkey,
+                    share_clipboard,
                     async {
                         let _ = stopped.await;
                     },
@@ -233,8 +245,95 @@ struct Active {
     locks: Option<(u32, Vec<String>)>,
 }
 
+/// This machine's clipboard, shared with every machine it drives: what is
+/// copied here is offered to all of them, and what is copied on one of them
+/// becomes the selection here, pasted from that machine.
+#[derive(Default)]
+struct Shared {
+    compositor: Option<Rc<Clipboard>>,
+    bridges: RefCell<BTreeMap<Side, Rc<Bridge>>>,
+    /// The selection made here, for a machine that connects later.
+    selection: RefCell<Option<Vec<String>>>,
+    /// The machine whose copy is the selection here.
+    holder: Cell<Option<Side>>,
+}
+
+impl Shared {
+    fn on_compositor(&self, ev: ClipboardEvent) {
+        match ev {
+            ClipboardEvent::Selection { mime_types } => {
+                // Offering nothing withdraws what the machines were offered.
+                let mime_types = if crate::clipboard_ui::sensitive_selection(&mime_types) {
+                    Vec::new()
+                } else {
+                    mime_types
+                };
+                self.holder.set(None);
+                *self.selection.borrow_mut() = Some(mime_types.clone());
+                let bridges: Vec<_> = self.bridges.borrow().values().cloned().collect();
+                for bridge in bridges {
+                    bridge.on_compositor_event(ClipboardEvent::Selection {
+                        mime_types: mime_types.clone(),
+                    });
+                }
+            }
+            paste @ ClipboardEvent::Paste { .. } => {
+                let bridge = self
+                    .holder
+                    .get()
+                    .and_then(|side| self.bridges.borrow().get(&side).cloned());
+                if let Some(bridge) = bridge {
+                    bridge.on_compositor_event(paste);
+                }
+            }
+        }
+    }
+
+    fn connected(&self, side: Side, bridge: Rc<Bridge>) {
+        let selection = self.selection.borrow().clone();
+        if let Some(mime_types) = selection.filter(|_| self.holder.get().is_none()) {
+            bridge.on_compositor_event(ClipboardEvent::Selection { mime_types });
+        }
+        self.bridges.borrow_mut().insert(side, bridge);
+    }
+
+    fn disconnected(&self, side: Side) {
+        self.bridges.borrow_mut().remove(&side);
+        if self.holder.get() == Some(side) {
+            self.holder.set(None);
+            if let Some(compositor) = &self.compositor {
+                compositor.offer(Vec::new());
+            }
+        }
+    }
+
+    fn on_peer(&self, side: Side, msg: ClipboardMsg, payload: Bytes) {
+        if let ClipboardMsg::Offer {
+            mime_types, files, ..
+        } = &msg
+        {
+            if !mime_types.is_empty() || !files.is_empty() {
+                self.holder.set(Some(side));
+                *self.selection.borrow_mut() = None;
+            } else if self.holder.get() != Some(side) {
+                // That machine's clipboard emptied; ours is not its copy.
+                return;
+            }
+        }
+        let bridge = self.bridges.borrow().get(&side).cloned();
+        if let Some(bridge) = bridge {
+            bridge.on_peer_msg(msg, payload);
+        }
+    }
+}
+
 /// Run `controls` until Ctrl+C or SIGTERM, for `gliff --control`.
-pub fn run(controls: &[Control], server_bin: &str, hotkey: &str) -> anyhow::Result<()> {
+pub fn run(
+    controls: &[Control],
+    server_bin: &str,
+    hotkey: &str,
+    share_clipboard: bool,
+) -> anyhow::Result<()> {
     let ended = async {
         let Ok(mut term) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -247,13 +346,21 @@ pub fn run(controls: &[Control], server_bin: &str, hotkey: &str) -> anyhow::Resu
             _ = term.recv() => {}
         }
     };
-    drive(controls, server_bin, hotkey, ended, Box::new(|_| {}))
+    drive(
+        controls,
+        server_bin,
+        hotkey,
+        share_clipboard,
+        ended,
+        Box::new(|_| {}),
+    )
 }
 
 fn drive(
     controls: &[Control],
     server_bin: &str,
     hotkey: &str,
+    share_clipboard: bool,
     stop: impl std::future::Future<Output = ()>,
     report: Box<dyn FnMut(Report)>,
 ) -> anyhow::Result<()> {
@@ -287,13 +394,46 @@ fn drive(
         .context("set up the screen edges")?;
         let (keymap_tx, keymap_rx) = watch::channel(String::new());
         let (up_tx, up_rx) = unbounded_channel();
+        let (clip_tx, mut clip_rx) = unbounded_channel();
+        let compositor = share_clipboard
+            .then(|| {
+                Clipboard::start(
+                    Default::default(),
+                    Box::new(move |ev| {
+                        let _ = clip_tx.send(ev);
+                    }),
+                )
+                .map_err(|e| tracing::warn!(error = %e, "clipboard bridge unavailable"))
+                .ok()
+                .map(Rc::new)
+            })
+            .flatten();
+        let shared = Rc::new(Shared {
+            compositor,
+            ..Shared::default()
+        });
+        tokio::task::spawn_local({
+            let shared = shared.clone();
+            async move {
+                while let Some(ev) = clip_rx.recv().await {
+                    shared.on_compositor(ev);
+                }
+            }
+        });
         let mut links = BTreeMap::new();
         for c in controls {
             let mut target = SshTarget::new(c.host.clone());
             target.server_bin = server_bin.to_string();
             target.server_args = vec!["--control".into(), c.side.opposite().name().into()];
             let (to, from) = unbounded_channel();
-            tokio::task::spawn_local(link(c.side, target, keymap_rx.clone(), up_tx.clone(), from));
+            tokio::task::spawn_local(link(
+                c.side,
+                target,
+                keymap_rx.clone(),
+                up_tx.clone(),
+                from,
+                shared.clone(),
+            ));
             links.insert(
                 c.side,
                 Link {
@@ -630,11 +770,12 @@ async fn link(
     mut keymap: watch::Receiver<String>,
     up: UnboundedSender<Up>,
     mut out: UnboundedReceiver<ClientMsg>,
+    shared: Rc<Shared>,
 ) {
     let mut delay = RETRY_FIRST;
     loop {
         let started = Instant::now();
-        let error = match session(side, &target, &mut keymap, &up, &mut out).await {
+        let error = match session(side, &target, &mut keymap, &up, &mut out, &shared).await {
             Ok(()) => {
                 tracing::info!(host = %target.host, "connection closed");
                 None
@@ -645,6 +786,7 @@ async fn link(
                 Some(error)
             }
         };
+        shared.disconnected(side);
         let _ = up.send(Up {
             side,
             extent: None,
@@ -665,6 +807,7 @@ async fn session(
     keymap: &mut watch::Receiver<String>,
     up: &UnboundedSender<Up>,
     out: &mut UnboundedReceiver<ClientMsg>,
+    shared: &Shared,
 ) -> anyhow::Result<()> {
     let SshStream {
         child: _child,
@@ -725,6 +868,15 @@ async fn session(
         extent: Some(extent),
         error: None,
     });
+    let (clip_out_tx, mut clip_out) = outbound_channel();
+    shared.connected(
+        side,
+        Rc::new(Bridge::new(
+            Transfers::new(clip_out_tx, clipboard::Side::Client),
+            Jobs::new(|_, _| {}),
+            shared.compositor.clone(),
+        )),
+    );
     let mut keymap_alive = true;
     // The last layout and locks written. Keymaps and locks reach this loop by
     // separate ways, so the locks are written again after each keymap: a
@@ -744,6 +896,9 @@ async fn session(
                 Some(msg) => write(&mut writer, &msg).await?,
                 None => return Ok(()),
             },
+            Some((msg, payload)) = clip_out.recv() => {
+                write_with(&mut writer, &ClientMsg::from(msg), &payload).await?;
+            }
             changed = keymap.changed(), if keymap_alive => match changed {
                 Ok(()) => {
                     let text = keymap.borrow_and_update().clone();
@@ -760,7 +915,21 @@ async fn session(
                 heard = Instant::now();
                 match read {
                     Ok(ServerMsg::Ping { t }) => write(&mut writer, &ClientMsg::Pong { t }).await?,
-                    Ok(_) => {}
+                    Ok(msg) => {
+                        if let Ok(clip) = msg.into_clipboard() {
+                            let payload = match &clip {
+                                ClipboardMsg::Data { data_len, .. } => {
+                                    anyhow::ensure!(
+                                        *data_len as usize <= CHUNK,
+                                        "clipboard chunk of {data_len} bytes exceeds the limit"
+                                    );
+                                    reader.read_payload(*data_len).await?
+                                }
+                                _ => Bytes::new(),
+                            };
+                            shared.on_peer(side, clip, payload);
+                        }
+                    }
                     Err(gliff_transport::Error::Closed) => return Ok(()),
                     Err(e) => return Err(e.into()),
                 }
@@ -784,7 +953,23 @@ async fn write<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut Framed<W>,
     msg: &ClientMsg,
 ) -> anyhow::Result<()> {
-    tokio::time::timeout(SILENCE, writer.write_msg(msg))
+    write_with(writer, msg, &[]).await
+}
+
+/// [`write`], with the chunk that follows a clipboard message.
+async fn write_with<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut Framed<W>,
+    msg: &ClientMsg,
+    payload: &[u8],
+) -> anyhow::Result<()> {
+    let written = async {
+        if payload.is_empty() {
+            writer.write_msg(msg).await
+        } else {
+            writer.write_msg_with_payloads(msg, &[payload]).await
+        }
+    };
+    tokio::time::timeout(SILENCE, written)
         .await
         .map_err(|_| anyhow::anyhow!("the other machine stopped taking input"))??;
     Ok(())
@@ -793,6 +978,55 @@ async fn write<W: tokio::io::AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn offer(mime: &[&str]) -> ClipboardMsg {
+        ClipboardMsg::Offer {
+            serial: 1,
+            mime_types: mime.iter().map(|m| m.to_string()).collect(),
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_last_copy_holds_the_clipboard() {
+        let shared = Shared::default();
+        shared.on_compositor(ClipboardEvent::Selection {
+            mime_types: vec!["text/plain".into()],
+        });
+        assert_eq!(shared.holder.get(), None);
+
+        shared.on_peer(Side::Left, offer(&["text/plain"]), Bytes::new());
+        assert_eq!(shared.holder.get(), Some(Side::Left));
+        assert!(shared.selection.borrow().is_none());
+
+        // Another machine's clipboard emptying takes nothing from the holder.
+        shared.on_peer(Side::Right, offer(&[]), Bytes::new());
+        assert_eq!(shared.holder.get(), Some(Side::Left));
+
+        shared.on_peer(Side::Right, offer(&["text/plain"]), Bytes::new());
+        assert_eq!(shared.holder.get(), Some(Side::Right));
+
+        // A machine that was not holding it going away changes nothing.
+        shared.disconnected(Side::Left);
+        assert_eq!(shared.holder.get(), Some(Side::Right));
+        shared.disconnected(Side::Right);
+        assert_eq!(shared.holder.get(), None);
+
+        shared.on_peer(Side::Left, offer(&["text/plain"]), Bytes::new());
+        shared.on_compositor(ClipboardEvent::Selection {
+            mime_types: vec!["text/html".into()],
+        });
+        assert_eq!(shared.holder.get(), None);
+        assert_eq!(
+            shared.selection.borrow().as_deref(),
+            Some(&["text/html".to_string()][..])
+        );
+
+        shared.on_compositor(ClipboardEvent::Selection {
+            mime_types: vec!["text/plain".into(), "x-kde-passwordManagerHint".into()],
+        });
+        assert_eq!(shared.selection.borrow().as_deref(), Some(&[][..]));
+    }
 
     #[test]
     fn parses_side_and_host() {

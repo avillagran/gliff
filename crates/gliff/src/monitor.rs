@@ -650,6 +650,7 @@ impl Controller {
             }],
             ui.cli.server_bin.clone(),
             ui.cli.release_hotkey.clone(),
+            !ui.cli.no_clipboard,
             tx,
         );
         let handle = match handle {
