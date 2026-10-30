@@ -332,7 +332,19 @@ impl State {
         let Some(i) = self.end_capture() else {
             return;
         };
-        let (x, y) = release_point(self.edges[i].rect, self.edges[i].side, along);
+        // Screens may have moved or changed scale while the pointer was
+        // away, so the layout is read again; the one from the start is the
+        // fallback when it cannot be.
+        let side = self.edges[i].side;
+        match self.instance.monitors() {
+            Ok(monitors) => {
+                if let Some((_, rect)) = screen_on(&monitors, side) {
+                    self.edges[i].rect = rect;
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "could not read the screens again"),
+        }
+        let (x, y) = release_point(self.edges[i].rect, side, along);
         if let Err(e) = self.instance.move_cursor(x, y) {
             tracing::warn!(error = %e, "could not put the pointer back");
         }

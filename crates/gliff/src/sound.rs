@@ -5,6 +5,8 @@
 //! plays it. The other machine's output is muted meanwhile, so the sound
 //! moves here rather than playing twice, and unmuted again however the
 //! stream ends: the script restores it on exit, and ssh going away ends it.
+//! The output muted and unmuted is the one that was the default when the
+//! sound started, even if another becomes the default meanwhile.
 //! It mutes only once the capture has woken the output: WirePlumber restores
 //! a suspended output's saved mute when it wakes, which would undo it.
 
@@ -34,15 +36,16 @@ const STDERR_LINES: usize = 4;
 /// the remote login shell would not keep.
 const REMOTE_SCRIPT: &str = r#"command -v pw-record >/dev/null || { echo "pw-record (PipeWire) is not installed there" >&2; exit 127; }
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-was=$(pactl get-sink-mute @DEFAULT_SINK@ 2>/dev/null)
 sink=$(pactl get-default-sink 2>/dev/null)
+sink=${sink:-@DEFAULT_SINK@}
+was=$(pactl get-sink-mute "$sink" 2>/dev/null)
 pw-record "$@" -P "{ stream.capture.sink = true }" - &
 rec=$!
-restore() { kill $rec 2>/dev/null; [ "$was" = "Mute: no" ] && pactl set-sink-mute @DEFAULT_SINK@ 0; }
+restore() { kill $rec 2>/dev/null; [ "$was" = "Mute: no" ] && pactl set-sink-mute "$sink" 0; }
 trap restore EXIT
 trap exit HUP INT TERM PIPE
 for i in 1 2 3 4 5 6 7 8 9 10; do pactl list short sinks 2>/dev/null | grep -F "$sink" | grep -q RUNNING && break; sleep 0.2; done
-[ "$was" = "Mute: no" ] && { pactl set-sink-mute @DEFAULT_SINK@ 1; sleep 1; pactl set-sink-mute @DEFAULT_SINK@ 1; }
+[ "$was" = "Mute: no" ] && { pactl set-sink-mute "$sink" 1; sleep 1; pactl set-sink-mute "$sink" 1; }
 wait $rec"#;
 
 /// Another machine's sound, playing here. Dropping it stops the sound.

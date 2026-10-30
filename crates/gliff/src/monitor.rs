@@ -79,8 +79,9 @@ struct Driven {
     side: String,
     handle: control::Handle,
     connected: bool,
-    /// Its sound, while it plays here.
-    sound: Option<Rc<RefCell<Option<Sound>>>>,
+    /// Its sound, while it plays here, with the id that tells this run's end
+    /// from that of one stopped earlier.
+    sound: Option<(u64, Rc<RefCell<Option<Sound>>>)>,
 }
 
 pub struct Controller {
@@ -316,11 +317,15 @@ impl Controller {
             if c.tray.borrow().is_none() {
                 return glib::ControlFlow::Break;
             }
-            if rx.try_recv().is_ok() {
-                c.show_window();
-                return glib::ControlFlow::Break;
+            match rx.try_recv() {
+                Err(mpsc::TryRecvError::Empty) => glib::ControlFlow::Continue,
+                // A click, or the icon gone with its thread: without the
+                // icon, the window is the only way to stop what runs.
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => {
+                    c.show_window();
+                    glib::ControlFlow::Break
+                }
             }
-            glib::ControlFlow::Continue
         });
     }
 
@@ -343,14 +348,19 @@ impl Controller {
         if playing != Some(false) {
             return;
         }
+        let id = self.next_id.get() + 1;
+        self.next_id.set(id);
         let weak = Rc::downgrade(self);
         let ended_name = name.to_string();
         let started = Sound::start(name, move |why| {
             let Some(c) = weak.upgrade() else {
                 return;
             };
-            if let Some(d) = c.driven.borrow_mut().get_mut(&ended_name) {
-                d.sound = None;
+            // A sound stopped and started again ends after the new one
+            // began; that end is not the new one's.
+            match c.driven.borrow_mut().get_mut(&ended_name) {
+                Some(d) if d.sound.as_ref().is_some_and(|(run, _)| *run == id) => d.sound = None,
+                _ => return,
             }
             if let Some(why) = why {
                 c.note(&format!("No sound from {ended_name}: {why}"));
@@ -360,7 +370,7 @@ impl Controller {
         match started {
             Ok(sound) => {
                 if let Some(d) = self.driven.borrow_mut().get_mut(name) {
-                    d.sound = Some(sound);
+                    d.sound = Some((id, sound));
                 }
             }
             Err(e) => self.note(&format!("Cannot play {name}'s sound here: {e}")),
@@ -374,7 +384,7 @@ impl Controller {
             .borrow_mut()
             .get_mut(name)
             .and_then(|d| d.sound.take());
-        if let Some(sound) = sound {
+        if let Some((_, sound)) = sound {
             sound.borrow_mut().take();
         }
         self.update_control_button();
@@ -735,7 +745,7 @@ impl Controller {
             return;
         };
         driven.handle.stop();
-        if let Some(sound) = driven.sound.take() {
+        if let Some((_, sound)) = driven.sound.take() {
             sound.borrow_mut().take();
         }
         let handle = driven.handle;
