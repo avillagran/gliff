@@ -11,12 +11,12 @@ use wayland_client::protocol::wl_compositor::WlCompositor;
 use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
 use wayland_client::protocol::wl_output::{self, WlOutput};
 use wayland_client::protocol::wl_pointer::{self, WlPointer};
-use wayland_client::protocol::wl_registry::WlRegistry;
+use wayland_client::protocol::wl_registry::{self, WlRegistry};
 use wayland_client::protocol::wl_seat::{self, WlSeat};
 use wayland_client::protocol::wl_shm::{self, WlShm};
 use wayland_client::protocol::wl_shm_pool::WlShmPool;
 use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{delegate_noop, Connection, Dispatch, QueueHandle, WEnum};
+use wayland_client::{delegate_noop, Connection, Dispatch, Proxy, QueueHandle, WEnum};
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibit_manager_v1::ZwpKeyboardShortcutsInhibitManagerV1;
 use wayland_protocols::wp::keyboard_shortcuts_inhibit::zv1::client::zwp_keyboard_shortcuts_inhibitor_v1::ZwpKeyboardShortcutsInhibitorV1;
 use wayland_protocols::wp::pointer_constraints::zv1::client::zwp_locked_pointer_v1::{
@@ -49,6 +49,10 @@ struct Edge {
     side: Side,
     output: String,
     rect: Rect,
+    /// Whether the owner wants it to take the pointer. It keeps a surface
+    /// while armed, given again when its screen changes or the compositor
+    /// closes it.
+    armed: bool,
     mapped: Option<Mapped>,
 }
 
@@ -120,6 +124,7 @@ fn run(
             side,
             output,
             rect,
+            armed: false,
             mapped: None,
         });
     }
@@ -333,20 +338,52 @@ impl State {
             return;
         };
         // Screens may have moved or changed scale while the pointer was
-        // away, so the layout is read again; the one from the start is the
-        // fallback when it cannot be.
+        // away, and an edge kept while it was captured moves now.
+        self.refresh_edges();
         let side = self.edges[i].side;
-        match self.instance.monitors() {
-            Ok(monitors) => {
-                if let Some((_, rect)) = screen_on(&monitors, side) {
-                    self.edges[i].rect = rect;
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "could not read the screens again"),
-        }
         let (x, y) = release_point(self.edges[i].rect, side, along);
         if let Err(e) = self.instance.move_cursor(x, y) {
             tracing::warn!(error = %e, "could not put the pointer back");
+        }
+    }
+}
+
+impl State {
+    /// Follow the layout: each edge runs along the screen now outermost on
+    /// its side, with that screen's rectangle. An armed edge whose screen
+    /// changed is put on the new one, unless it holds the pointer; it moves
+    /// once the pointer is given back. When the screens cannot be read, the
+    /// edges stay as they were.
+    fn refresh_edges(&mut self) {
+        let monitors = match self.instance.monitors() {
+            Ok(monitors) => monitors,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the screens again");
+                return;
+            }
+        };
+        for i in 0..self.edges.len() {
+            let side = self.edges[i].side;
+            let Some((output, rect)) = screen_on(&monitors, side) else {
+                continue;
+            };
+            tracing::debug!(side = side.name(), %output, ?rect, "outermost screen");
+            self.edges[i].rect = rect;
+            if self.capture.as_ref().is_some_and(|c| c.edge == i) {
+                continue;
+            }
+            // A screen Wayland has not finished announcing is taken once it
+            // has: its own burst ends with another refresh.
+            if output != self.edges[i].output
+                && self.outputs.get(&output).is_some_and(|(_, info)| info.done)
+            {
+                tracing::info!(side = side.name(), %output, "the edge moves to another screen");
+                self.edges[i].output = output;
+                self.unmap(i);
+            }
+            if self.edges[i].armed {
+                self.map(i);
+            }
         }
     }
 }
@@ -359,6 +396,7 @@ impl LoopState for State {
             EdgeCmd::Arm { side, armed } => {
                 for i in 0..self.edges.len() {
                     if self.edges[i].side == side {
+                        self.edges[i].armed = armed;
                         if armed {
                             self.map(i);
                         } else {
@@ -384,13 +422,31 @@ impl LoopState for State {
 
 impl Dispatch<WlRegistry, GlobalListContents> for State {
     fn event(
-        _: &mut Self,
-        _: &WlRegistry,
-        _: <WlRegistry as wayland_client::Proxy>::Event,
+        state: &mut Self,
+        registry: &WlRegistry,
+        event: <WlRegistry as wayland_client::Proxy>::Event,
         _: &GlobalListContents,
         _: &Connection,
-        _: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
+        // A screen plugged in is followed once its first burst is done; one
+        // unplugged, at once.
+        match event {
+            wl_registry::Event::Global {
+                name, interface, ..
+            } if interface == WlOutput::interface().name => {
+                tracing::debug!(name, "a screen was plugged in");
+                state.outputs.add(registry, name, qh);
+            }
+            wl_registry::Event::GlobalRemove { name } => {
+                let was_output = state.outputs.remove(name);
+                tracing::debug!(name, was_output, "a global went away");
+                if was_output {
+                    state.refresh_edges();
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -403,7 +459,9 @@ impl Dispatch<WlOutput, ()> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        state.outputs.handle(output, event);
+        if state.outputs.handle(output, event) {
+            state.refresh_edges();
+        }
     }
 }
 
@@ -612,7 +670,16 @@ impl Dispatch<ZwlrLayerSurfaceV1, usize> for State {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        // An edge given a new surface may still hear about its old one.
+        let current = state.edges[i]
+            .mapped
+            .as_ref()
+            .is_some_and(|m| m.layer == *layer);
         match event {
+            zwlr_layer_surface_v1::Event::Configure { serial, .. } if !current => {
+                layer.ack_configure(serial);
+            }
+            zwlr_layer_surface_v1::Event::Closed if !current => {}
             zwlr_layer_surface_v1::Event::Configure {
                 serial,
                 width,
