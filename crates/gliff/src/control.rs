@@ -121,6 +121,76 @@ struct Up {
     /// The other machine's screen in logical pixels, or `None` when the link
     /// is down.
     extent: Option<(f64, f64)>,
+    /// Why the link went down, when it failed.
+    error: Option<String>,
+}
+
+/// What a running control tells whoever started it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Report {
+    /// The machine answers: its edge takes the pointer.
+    Connected { host: String },
+    /// The machine cannot be reached now; gliff keeps trying.
+    Disconnected { host: String, error: Option<String> },
+    /// The control ended, with why when it failed.
+    Ended { error: Option<String> },
+}
+
+/// A control running on its own thread, as the window starts one. Dropping
+/// it stops the control and gives the pointer back.
+pub struct Handle {
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Handle {
+    /// Run `controls` until stopped, telling `report` how they are doing.
+    pub fn spawn(
+        controls: Vec<Control>,
+        server_bin: String,
+        hotkey: String,
+        report: std::sync::mpsc::Sender<Report>,
+    ) -> std::io::Result<Self> {
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let join = std::thread::Builder::new()
+            .name("gliff-control".into())
+            .spawn(move || {
+                let tell = report.clone();
+                let result = drive(
+                    &controls,
+                    &server_bin,
+                    &hotkey,
+                    async {
+                        let _ = stopped.await;
+                    },
+                    Box::new(move |r| {
+                        let _ = tell.send(r);
+                    }),
+                );
+                let _ = report.send(Report::Ended {
+                    error: result.err().map(|e| format!("{e:#}")),
+                });
+            })?;
+        Ok(Self {
+            stop: Some(stop),
+            join: Some(join),
+        })
+    }
+
+    pub fn stop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        self.stop();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 struct Link {
@@ -138,7 +208,30 @@ struct Active {
     buttons: BTreeSet<u32>,
 }
 
+/// Run `controls` until Ctrl+C or SIGTERM, for `gliff --control`.
 pub fn run(controls: &[Control], server_bin: &str, hotkey: &str) -> anyhow::Result<()> {
+    let ended = async {
+        let Ok(mut term) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        else {
+            let _ = tokio::signal::ctrl_c().await;
+            return;
+        };
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = term.recv() => {}
+        }
+    };
+    drive(controls, server_bin, hotkey, ended, Box::new(|_| {}))
+}
+
+fn drive(
+    controls: &[Control],
+    server_bin: &str,
+    hotkey: &str,
+    stop: impl std::future::Future<Output = ()>,
+    report: Box<dyn FnMut(Report)>,
+) -> anyhow::Result<()> {
     let hotkey = Hotkey::parse(hotkey).unwrap_or_else(|e| {
         tracing::warn!(error = %e, "unusable release hotkey; using shift+escape");
         Hotkey::parse("shift+escape").expect("the default hotkey parses")
@@ -192,8 +285,9 @@ pub fn run(controls: &[Control], server_bin: &str, hotkey: &str) -> anyhow::Resu
             hotkey,
             keymap: keymap_tx,
             keys: None,
+            report,
         };
-        controller.run(ev_rx, up_rx).await
+        controller.run(ev_rx, up_rx, stop).await
     })
 }
 
@@ -205,6 +299,7 @@ struct Controller {
     keymap: watch::Sender<String>,
     /// The local keyboard's state, while the keymap is known.
     keys: Option<xkb::State>,
+    report: Box<dyn FnMut(Report)>,
 }
 
 impl Controller {
@@ -212,8 +307,9 @@ impl Controller {
         &mut self,
         mut events: UnboundedReceiver<EdgeEvent>,
         mut ups: UnboundedReceiver<Up>,
+        stop: impl std::future::Future<Output = ()>,
     ) -> anyhow::Result<()> {
-        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::pin!(stop);
         loop {
             tokio::select! {
                 event = events.recv() => match event {
@@ -221,8 +317,7 @@ impl Controller {
                     None => anyhow::bail!("the screen edges stopped"),
                 },
                 Some(up) = ups.recv() => self.on_link(up),
-                _ = tokio::signal::ctrl_c() => break,
-                _ = term.recv() => break,
+                _ = &mut stop => break,
             }
         }
         self.release();
@@ -245,15 +340,25 @@ impl Controller {
             return;
         };
         link.extent = up.extent;
+        let host = link.host.clone();
         match up.extent {
-            Some((w, h)) => tracing::info!(
-                host = %link.host,
-                width = w,
-                height = h,
-                "move the pointer past the {} edge to control it",
-                up.side.name()
-            ),
-            None => tracing::info!(host = %link.host, "not connected"),
+            Some((w, h)) => {
+                tracing::info!(
+                    %host,
+                    width = w,
+                    height = h,
+                    "move the pointer past the {} edge to control it",
+                    up.side.name()
+                );
+                (self.report)(Report::Connected { host });
+            }
+            None => {
+                tracing::info!(%host, "not connected");
+                (self.report)(Report::Disconnected {
+                    host,
+                    error: up.error,
+                });
+            }
         }
         let _ = self.edges.send(EdgeCmd::Arm {
             side: up.side,
@@ -484,13 +589,22 @@ async fn link(
     let mut delay = RETRY_FIRST;
     loop {
         let started = Instant::now();
-        match session(side, &target, &mut keymap, &up, &mut out).await {
-            Ok(()) => tracing::info!(host = %target.host, "connection closed"),
-            Err(e) => {
-                tracing::warn!(host = %target.host, error = format!("{e:#}"), "connection failed")
+        let error = match session(side, &target, &mut keymap, &up, &mut out).await {
+            Ok(()) => {
+                tracing::info!(host = %target.host, "connection closed");
+                None
             }
-        }
-        let _ = up.send(Up { side, extent: None });
+            Err(e) => {
+                let error = format!("{e:#}");
+                tracing::warn!(host = %target.host, %error, "connection failed");
+                Some(error)
+            }
+        };
+        let _ = up.send(Up {
+            side,
+            extent: None,
+            error,
+        });
         while out.try_recv().is_ok() {}
         if started.elapsed() > STABLE {
             delay = RETRY_FIRST;
@@ -556,6 +670,7 @@ async fn session(
     let _ = up.send(Up {
         side,
         extent: Some(extent),
+        error: None,
     });
     let mut keymap_alive = true;
     loop {
