@@ -435,9 +435,13 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .icon_name("emblem-system-symbolic")
         .tooltip_text("Where the other machine's screen stands")
         .build();
+    let control_btn = gtk::Button::builder()
+        .icon_name("input-mouse-symbolic")
+        .build();
     // A --stdio window is itself the other machine's screen.
     if !cli.stdio {
         header.pack_end(&monitor_btn);
+        header.pack_end(&control_btn);
         header.pack_end(&monitor_settings_btn);
     }
 
@@ -541,6 +545,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         &ui,
         &monitor_btn,
         &monitor_settings_btn,
+        &control_btn,
     ));
     refresh_tabs(&ui);
 
@@ -918,6 +923,9 @@ fn refresh_tabs(ui: &Rc<App>) {
     if !has_tabs {
         show_address_bar(ui, true);
     }
+    if let Some(m) = ui.monitor.borrow().as_ref() {
+        m.update_control_button();
+    }
 }
 
 /// A machine's tab: its name, which shows that machine, and a button that
@@ -926,7 +934,8 @@ fn refresh_tabs(ui: &Rc<App>) {
 fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     let session = find_session(ui, name);
     let screen_in_use = ui.monitor.borrow().as_ref().is_some_and(|m| m.owns(name));
-    let running = session.is_some() || screen_in_use;
+    let driven = ui.monitor.borrow().as_ref().is_some_and(|m| m.drives(name));
+    let running = session.is_some() || screen_in_use || driven;
     // The name is a plain label and the whole tab takes the click, so no
     // part of a tab takes keyboard focus and grows a focus ring.
     let label = gtk::Label::builder()
@@ -938,7 +947,12 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     }
     // The slot on the right shows whether the machine is connected, and
     // turns into its button while the pointer is on it.
-    let connected = session.as_ref().is_some_and(|s| s.connected.get());
+    let connected = session.as_ref().is_some_and(|s| s.connected.get())
+        || ui
+            .monitor
+            .borrow()
+            .as_ref()
+            .is_some_and(|m| m.drives_connected(name));
     let status_tip = if connected {
         "Connected"
     } else {
@@ -1027,6 +1041,10 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
                     if let Some(m) = ui.monitor.borrow().clone() {
                         m.stop();
                     }
+                } else if driven && find_session(&ui, &name).is_none() {
+                    if let Some(m) = ui.monitor.borrow().clone() {
+                        m.stop_control(&name);
+                    }
                 } else if running {
                     stop_session(&ui, &name);
                 } else {
@@ -1083,6 +1101,11 @@ fn select_tab(ui: &Rc<App>, name: &str) {
         show_lending(ui, name);
         return;
     }
+    let driven = ui.monitor.borrow().as_ref().is_some_and(|m| m.drives(name));
+    if driven && find_session(ui, name).is_none() {
+        show_controlling(ui, name);
+        return;
+    }
     match find_session(ui, name) {
         Some(s) => {
             if s.gave_up.get() {
@@ -1109,6 +1132,22 @@ fn show_lending(ui: &Rc<App>, name: &str) {
         ui,
         &format!("{name}'s screen is in use as a screen of this computer."),
     );
+}
+
+/// Select `name`'s tab while it is driven from this computer's edge,
+/// without its session: its picture here would only take the pointer away
+/// from that edge.
+fn show_controlling(ui: &Rc<App>, name: &str) {
+    let monitor = ui.monitor.borrow().clone();
+    if let Some(m) = &monitor {
+        m.choose(name);
+    }
+    show_nothing(ui);
+    stop_session(ui, name);
+    if let Some(m) = &monitor {
+        show_status(ui, &m.control_status(name));
+    }
+    refresh_tabs(ui);
 }
 
 /// Connect to `endpoint` in a new session and show it.
