@@ -1502,6 +1502,12 @@ fn offer_install(ui: Rc<App>, s: Rc<Session>, generation: u64) {
                     start_session(ui.clone(), s.clone());
                 }
             }
+            remote_install::Outcome::Shadowed(why) => {
+                tracing::warn!(machine = %s.name, %why, "remote install hidden");
+                if current() {
+                    set_status(&ui, &s, &why);
+                }
+            }
             remote_install::Outcome::Failed(why) => {
                 tracing::error!(machine = %s.name, error = %why, "remote install failed");
                 if current() {

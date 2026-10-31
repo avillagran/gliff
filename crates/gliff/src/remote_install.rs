@@ -25,6 +25,9 @@ const TIMEOUT: Duration = Duration::from_secs(180);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Where gliff-server is uploaded to, in the remote home, for the script.
 const UPLOAD: &str = "~/.local/bin/.gliff-server.upload";
+/// Where the script puts gliff-server, as a command for the remote shell:
+/// the one to run when another comes first on that machine's PATH.
+pub const USER_SERVER: &str = "~/.local/bin/gliff-server";
 
 /// What the remote script reports, as one JSON line.
 #[derive(Debug, Deserialize, PartialEq)]
@@ -44,6 +47,10 @@ struct Reply {
 pub enum Outcome {
     /// gliff-server is on the remote PATH now, or already was.
     Ready(String),
+    /// gliff-server was installed at [`USER_SERVER`], but `gliff-server`
+    /// over ssh on that machine is still another one, or none: an older
+    /// package comes first on its PATH, or `~/.local/bin` is not on it.
+    Shadowed(String),
     Failed(String),
 }
 
@@ -276,9 +283,10 @@ fn outcome(stdout: &str, stderr: &str) -> Outcome {
         Reply {
             on_path: Some(false),
             ..
-        } => Outcome::Failed(
-            "gliff was installed in ~/.local/bin, but ssh sessions on that machine \
-             do not have it on PATH"
+        } => Outcome::Shadowed(
+            "gliff was installed in ~/.local/bin, but over ssh that machine runs \
+             another gliff-server, or none: its PATH puts another first, or \
+             leaves ~/.local/bin out"
                 .into(),
         ),
         Reply {
@@ -294,15 +302,29 @@ mod tests {
     use std::io::Write;
     use std::process::{Command, Stdio};
 
-    /// The script's answer to adopting `upload`, with `home` as its home.
-    fn adopt(home: &std::path::Path, upload: &str) -> Outcome {
+    /// The script's answer to adopting `upload`, with `home` as its home
+    /// and `first` before `~/.local/bin` on PATH, or alone on it.
+    fn adopt(
+        home: &std::path::Path,
+        upload: &str,
+        first: &[&std::path::Path],
+        with_bin: bool,
+    ) -> Outcome {
         let bin = home.join(".local/bin");
         std::fs::create_dir_all(&bin).unwrap();
         let uploaded = bin.join(".gliff-server.upload");
         std::fs::write(&uploaded, upload).unwrap();
-        let mut python = Command::new("python3")
+        let dirs = first.iter().map(|p| p.to_path_buf());
+        let path = std::env::join_paths(dirs.chain(with_bin.then_some(bin))).unwrap();
+        // Found before PATH is narrowed to the test's directories.
+        let python = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join("python3"))
+            .find(|p| p.is_file())
+            .expect("python3 on PATH");
+        let mut python = Command::new(python)
             .args(["-I", "-", &upload.len().to_string()])
             .env("HOME", home)
+            .env("PATH", path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -327,26 +349,54 @@ mod tests {
 
         // An upload that cannot run changes nothing.
         let broken = "#!/nonexistent/interpreter\n";
-        assert!(matches!(adopt(&home, broken), Outcome::Failed(_)));
+        assert!(matches!(
+            adopt(&home, broken, &[], true),
+            Outcome::Failed(_)
+        ));
         assert!(!server.exists());
         // Without the feature it is no better than what is there.
         let old = "#!/bin/sh\necho gliff-server 0.1\n";
-        assert!(matches!(adopt(&home, old), Outcome::Failed(_)));
+        assert!(matches!(adopt(&home, old, &[], true), Outcome::Failed(_)));
         assert!(!server.exists());
 
         assert_eq!(
-            adopt(&home, good),
+            adopt(&home, good, &[], true),
             Outcome::Ready("Installed gliff 9.9".into())
         );
         assert_eq!(std::fs::read_to_string(&server).unwrap(), good);
         // gliff put that one there, so it may replace it.
         let newer = "#!/bin/sh\necho --control; echo gliff-server 10\n";
-        assert!(matches!(adopt(&home, newer), Outcome::Ready(_)));
+        assert!(matches!(adopt(&home, newer, &[], true), Outcome::Ready(_)));
         assert_eq!(std::fs::read_to_string(&server).unwrap(), newer);
         // The user's own is left alone.
         std::fs::write(&server, "mine").unwrap();
-        assert!(matches!(adopt(&home, good), Outcome::Failed(_)));
+        assert!(matches!(adopt(&home, good, &[], true), Outcome::Failed(_)));
         assert_eq!(std::fs::read_to_string(&server).unwrap(), "mine");
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
+    fn a_package_first_on_path_hides_the_installed_server() {
+        let home = std::env::temp_dir().join(format!("gliff-shadow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let system = home.join("usr/bin");
+        std::fs::create_dir_all(&system).unwrap();
+        let old = "#!/bin/sh\necho gliff-server 0.1\n";
+        std::fs::write(system.join("gliff-server"), old).unwrap();
+        std::fs::set_permissions(
+            system.join("gliff-server"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+        let good = "#!/bin/sh\necho --control; echo gliff-server 9.9\n";
+        let outcome = adopt(&home, good, &[&system], true);
+        assert!(matches!(outcome, Outcome::Shadowed(_)), "{outcome:?}");
+        // It is installed all the same, for the user install path to run.
+        let server = home.join(".local/bin/gliff-server");
+        assert_eq!(std::fs::read_to_string(&server).unwrap(), good);
+        // A PATH without ~/.local/bin at all says the same.
+        let outcome = adopt(&home, good, &[&system], false);
+        assert!(matches!(outcome, Outcome::Shadowed(_)), "{outcome:?}");
         std::fs::remove_dir_all(&home).unwrap();
     }
 
@@ -381,7 +431,7 @@ mod tests {
             Outcome::Failed("gliff needs Hyprland on that machine".into())
         );
         let off_path = r#"{"ok":true,"status":"installed","version":"1","on_path":false}"#;
-        assert!(matches!(outcome(off_path, ""), Outcome::Failed(_)));
+        assert!(matches!(outcome(off_path, ""), Outcome::Shadowed(_)));
     }
 
     #[test]

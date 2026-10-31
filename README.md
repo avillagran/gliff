@@ -227,8 +227,11 @@ gliff --control left:user@laptop --control right:user@desktop
 ```
 
 The other machine needs a `gliff-server` that knows `--control`; the pointer
-moves on its screen on the side facing this one. A machine that cannot be
-reached leaves its edge inactive until gliff connects to it again.
+moves on its screen on the side facing this one. When its gliff-server is too
+old, gliff offers to install this computer's for your user there, and drives
+it with that one even where an older package comes first on its PATH. A
+machine that cannot be reached leaves its edge inactive until gliff connects
+to it again.
 
 The clipboard is shared with each machine in both directions, and
 `--no-clipboard` turns that off. A copy made on one driven machine reaches

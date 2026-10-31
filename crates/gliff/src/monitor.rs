@@ -655,47 +655,65 @@ impl Controller {
         let settings = settings.clone();
         let c = self.clone();
         glib::spawn_future_local(async move {
-            let ready = c.server_ready(&name).await;
+            let server_bin = c.server_for(&name).await;
             c.checking.borrow_mut().remove(&name);
-            if ready && !c.control_refused(&name, &settings) {
-                c.drive(name, &settings);
+            if let Some(server_bin) = server_bin {
+                if !c.control_refused(&name, &settings) {
+                    c.drive(name, &settings, server_bin);
+                }
             }
         });
     }
 
-    /// Whether `name` can be driven, after updating it if the user agrees.
-    /// A machine that does not answer counts: connecting says why it failed.
-    async fn server_ready(&self, name: &str) -> bool {
-        let Some(ui) = self.ui.upgrade() else {
-            return false;
-        };
+    /// The gliff-server to drive `name` with, after updating it if the user
+    /// agrees; `None` when it cannot be driven. A machine that does not
+    /// answer counts: connecting says why it failed.
+    async fn server_for(&self, name: &str) -> Option<String> {
+        let ui = self.ui.upgrade()?;
         let server_bin = ui.cli.server_bin.clone();
-        if remote_install::supports_control(name, &server_bin).await != Some(false) {
-            return true;
+        if let Some(found) = self.server_that_controls(name, &server_bin).await {
+            return Some(found);
         }
         if !remote_install::confirm_update(&ui.window, name).await {
             self.note(&format!(
                 "{name} needs a newer gliff-server to be controlled."
             ));
-            return false;
+            return None;
         }
         self.note(&format!("Installing gliff-server on {name}…"));
-        if let Outcome::Failed(why) = remote_install::update_server(name).await {
-            self.note(&format!("Could not install gliff-server: {why}"));
-            return false;
+        match remote_install::update_server(name).await {
+            Outcome::Ready(_) | Outcome::Shadowed(_) => {}
+            Outcome::Failed(why) => {
+                self.note(&format!("Could not install gliff-server: {why}"));
+                return None;
+            }
         }
-        // Another one may come first on that machine's PATH.
-        if remote_install::supports_control(name, &server_bin).await == Some(false) {
-            self.note(&format!(
-                "{name} still runs an older gliff-server, which comes first on its PATH \
-                 over ssh."
-            ));
-            return false;
+        if let Some(found) = self.server_that_controls(name, &server_bin).await {
+            return Some(found);
         }
-        true
+        self.note(&format!(
+            "{name} still runs an older gliff-server, which comes first on its PATH \
+             over ssh."
+        ));
+        None
     }
 
-    fn drive(self: &Rc<Self>, name: String, settings: &Settings) {
+    /// `server_bin` when it can control `name`, or did not say; else the
+    /// one gliff installs for the user there, when that one can, as an
+    /// older package first on that machine's PATH would hide it.
+    async fn server_that_controls(&self, name: &str, server_bin: &str) -> Option<String> {
+        if remote_install::supports_control(name, server_bin).await != Some(false) {
+            return Some(server_bin.to_string());
+        }
+        let user_server = remote_install::USER_SERVER;
+        if remote_install::supports_control(name, user_server).await == Some(true) {
+            tracing::info!(machine = %name, server = user_server, "driving with the user install");
+            return Some(user_server.to_string());
+        }
+        None
+    }
+
+    fn drive(self: &Rc<Self>, name: String, settings: &Settings, server_bin: String) {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
@@ -708,7 +726,7 @@ impl Controller {
                 side,
                 host: name.clone(),
             }],
-            ui.cli.server_bin.clone(),
+            server_bin,
             ui.cli.release_hotkey.clone(),
             !ui.cli.no_clipboard,
             tx,
