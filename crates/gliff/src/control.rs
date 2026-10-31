@@ -29,6 +29,24 @@ const KEEPALIVE: Duration = Duration::from_secs(2);
 /// is dropped, so its edge stops taking the pointer to a machine that is
 /// gone without closing the connection.
 const SILENCE: Duration = Duration::from_secs(6);
+/// How long after the pointer comes back from one side another side leaves
+/// it here, so a fast return does not carry it straight across this screen.
+const SETTLE: Duration = Duration::from_millis(350);
+
+/// When the pointer last came back, and from which side. The window runs
+/// each machine's control on a thread of its own, so this is shared by them.
+static RETURNED: std::sync::Mutex<Option<(Instant, Side)>> = std::sync::Mutex::new(None);
+
+fn note_return(side: Side) {
+    if let Ok(mut returned) = RETURNED.lock() {
+        *returned = Some((Instant::now(), side));
+    }
+}
+
+/// Whether a pointer reaching `side` now is one still moving from a return.
+fn still_returning(returned: Option<(Instant, Side)>, side: Side, now: Instant) -> bool {
+    returned.is_some_and(|(at, from)| from != side && now.duration_since(at) < SETTLE)
+}
 
 /// One `--control` argument.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -487,6 +505,12 @@ impl Controller {
     }
 
     fn enter(&mut self, side: Side, along: f64) {
+        let returned = RETURNED.lock().ok().and_then(|r| *r);
+        if still_returning(returned, side, Instant::now()) {
+            tracing::info!(side = side.name(), "pointer still moving from a return");
+            let _ = self.edges.send(EdgeCmd::Release { along });
+            return;
+        }
         let Some((w, h)) = self.links.get(&side).and_then(|l| l.extent) else {
             let _ = self.edges.send(EdgeCmd::Release { along });
             return;
@@ -547,6 +571,7 @@ impl Controller {
     /// Let go of every key and button the other machine holds for us.
     fn release_remote(&mut self) -> Option<Active> {
         let a = self.active.take()?;
+        note_return(a.side);
         for &keycode in &a.keys {
             self.send(
                 a.side,
@@ -793,6 +818,22 @@ async fn write<W: tokio::io::AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_return_keeps_the_pointer_from_the_other_side_for_a_moment() {
+        let at = Instant::now();
+        let returned = Some((at, Side::Left));
+        assert!(still_returning(returned, Side::Right, at));
+        assert!(still_returning(
+            returned,
+            Side::Right,
+            at + SETTLE - Duration::from_millis(1)
+        ));
+        assert!(!still_returning(returned, Side::Right, at + SETTLE));
+        // Going straight back where it came from is not a mistake.
+        assert!(!still_returning(returned, Side::Left, at));
+        assert!(!still_returning(None, Side::Right, at));
+    }
 
     #[test]
     fn parses_side_and_host() {
