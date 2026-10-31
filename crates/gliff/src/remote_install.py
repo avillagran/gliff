@@ -142,6 +142,13 @@ def digest(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def on_path(target):
+    """Whether `gliff-server` over ssh here is `target`: ~/.local/bin may be
+    missing from PATH, or an older package may come first on it."""
+    found = shutil.which("gliff-server")
+    return bool(found) and os.path.realpath(found) == os.path.realpath(target)
+
+
 def read_manifest():
     try:
         manifest = json.loads(MANIFEST.read_text())
@@ -267,7 +274,7 @@ def adopt(size):
         write_manifest({"version": version, "complete": True, "files": files})
     finally:
         UPLOAD.unlink(missing_ok=True)
-    reply(ok=True, status="installed", version=version, path=str(target))
+    reply(ok=True, status="installed", version=version, path=str(target), on_path=on_path(target))
 
 
 def main():
@@ -302,9 +309,7 @@ def main():
         if missing:
             raise Refused("libraries", "Missing libraries on that machine: " + ", ".join(missing))
         install(staged, version)
-    bin_dir = str(HOME / ".local/bin")
-    reply(ok=True, status="installed", version=version, path=str(HOME / FILES["usr/bin/gliff-server"]),
-          on_path=bin_dir in os.environ.get("PATH", "").split(":"))
+    reply(ok=True, status="installed", version=version, path=str(HOME / SERVER), on_path=on_path(HOME / SERVER))
 
 
 if __name__ == "__main__":
