@@ -1674,6 +1674,49 @@ impl SessionOutput {
         format!("{x}x{y}")
     }
 
+    /// Put a headless output's mode back when Hyprland dropped the rule
+    /// that set it. A config reload does that, and Omarchy reloads when a
+    /// monitor comes or goes, which leaves the output at Hyprland's default
+    /// mode. Returns whether the mode had changed.
+    pub(crate) fn restore_mode(&self, instance: &hypr_ipc::Instance) -> bool {
+        if self.headless.is_none() {
+            return false;
+        }
+        let Ok(mons) = instance.monitors() else {
+            return false;
+        };
+        let Some(m) = mons.iter().find(|m| m.name == self.name) else {
+            return false;
+        };
+        if (m.width & !1) == self.width
+            && (m.height & !1) == self.height
+            && (m.scale - self.scale).abs() < 0.01
+        {
+            return false;
+        }
+        tracing::warn!(
+            now.width = m.width,
+            now.height = m.height,
+            now.scale = m.scale,
+            width = self.width,
+            height = self.height,
+            scale = self.scale,
+            "Hyprland changed the output's mode; setting it back"
+        );
+        let position = self.position(instance, self.width, self.height, self.scale);
+        if let Err(e) = instance.set_monitor_rule(
+            &self.name,
+            self.width,
+            self.height,
+            60,
+            &position,
+            self.scale,
+        ) {
+            tracing::warn!(error = %e, "could not set the output's mode back");
+        }
+        true
+    }
+
     /// The logical extent Hyprland exposes to clients and the virtual pointer.
     pub(crate) fn logical_extent(&self) -> InputCmd {
         let s = self.scale.max(0.5);
