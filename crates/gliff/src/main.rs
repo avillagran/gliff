@@ -16,6 +16,7 @@ mod paintable;
 mod recent;
 mod remote_install;
 mod sound;
+mod tablet;
 mod theme;
 mod tray;
 
@@ -454,6 +455,10 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .icon_name("audio-volume-muted-symbolic")
         .visible(false)
         .build();
+    let tablet_btn = gtk::Button::builder()
+        .icon_name("tablet-symbolic")
+        .tooltip_text("Use a tablet as a screen")
+        .build();
     let hide_btn = gtk::Button::builder()
         .icon_name("go-bottom-symbolic")
         .tooltip_text("Hide this window in the bar while it works in the background")
@@ -465,6 +470,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         header.pack_end(&sound_btn);
         header.pack_end(&control_btn);
         header.pack_end(&monitor_settings_btn);
+        header.pack_end(&tablet_btn);
         header.pack_end(&hide_btn);
     }
 
@@ -572,6 +578,14 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         &hide_btn,
         &sound_btn,
     ));
+    if !ui.cli.stdio {
+        let dir = ui
+            .config_path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        tablet::Tablet::install(&ui.window, &tablet_btn, dir);
+    }
     refresh_tabs(&ui);
 
     // Fullscreen toggle.

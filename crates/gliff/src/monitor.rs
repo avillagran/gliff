@@ -44,13 +44,13 @@ impl Default for Settings {
     }
 }
 
-const SIDES: [(&str, &str, i32, i32); 4] = [
+pub(crate) const SIDES: [(&str, &str, i32, i32); 4] = [
     ("above", "Above", 1, 0),
     ("left", "Left", 0, 1),
     ("right", "Right", 2, 1),
     ("below", "Below", 1, 2),
 ];
-const ALIGNMENTS: [(&str, &str); 3] = [
+pub(crate) const ALIGNMENTS: [(&str, &str); 3] = [
     ("start", "Align top or left edges"),
     ("center", "Center"),
     ("end", "Align bottom or right edges"),
@@ -61,6 +61,52 @@ impl Settings {
         SIDES.iter().any(|(s, ..)| *s == self.side)
             && ALIGNMENTS.iter().any(|(a, _)| *a == self.alignment)
     }
+}
+
+/// Buttons around "This computer" for the side a screen stands on, with
+/// `side` pressed.
+pub(crate) fn side_picker(side: &str) -> (gtk::Grid, Vec<(&'static str, gtk::ToggleButton)>) {
+    let grid = gtk::Grid::builder()
+        .row_spacing(6)
+        .column_spacing(6)
+        .halign(gtk::Align::Center)
+        .build();
+    grid.attach(&gtk::Label::new(Some("This computer")), 1, 1, 1, 1);
+    let mut sides: Vec<(&'static str, gtk::ToggleButton)> = Vec::new();
+    for (name, label, x, y) in SIDES {
+        let b = gtk::ToggleButton::with_label(label);
+        if let Some((_, first)) = sides.first() {
+            b.set_group(Some(first));
+        }
+        b.set_active(side == name);
+        grid.attach(&b, x, y, 1, 1);
+        sides.push((name, b));
+    }
+    (grid, sides)
+}
+
+pub(crate) fn picked_side(sides: &[(&'static str, gtk::ToggleButton)]) -> &'static str {
+    sides
+        .iter()
+        .find(|(_, b)| b.is_active())
+        .map_or("right", |(s, _)| *s)
+}
+
+/// How a screen lines up along its side, with `alignment` selected.
+pub(crate) fn alignment_picker(alignment: &str) -> gtk::DropDown {
+    let labels: Vec<&str> = ALIGNMENTS.iter().map(|(_, l)| *l).collect();
+    let align = gtk::DropDown::from_strings(&labels);
+    align.set_selected(
+        ALIGNMENTS
+            .iter()
+            .position(|(a, _)| *a == alignment)
+            .unwrap_or(0) as u32,
+    );
+    align
+}
+
+pub(crate) fn picked_alignment(align: &gtk::DropDown) -> &'static str {
+    ALIGNMENTS[(align.selected() as usize).min(ALIGNMENTS.len() - 1)].0
 }
 
 type Running = Rc<RefCell<Option<Display>>>;
@@ -503,31 +549,9 @@ impl Controller {
             .orientation(gtk::Orientation::Vertical)
             .spacing(12)
             .build();
-        let grid = gtk::Grid::builder()
-            .row_spacing(6)
-            .column_spacing(6)
-            .halign(gtk::Align::Center)
-            .build();
-        grid.attach(&gtk::Label::new(Some("This computer")), 1, 1, 1, 1);
-        let mut sides: Vec<(&'static str, gtk::ToggleButton)> = Vec::new();
-        for (side, label, x, y) in SIDES {
-            let b = gtk::ToggleButton::with_label(label);
-            if let Some((_, first)) = sides.first() {
-                b.set_group(Some(first));
-            }
-            b.set_active(saved.side == side);
-            grid.attach(&b, x, y, 1, 1);
-            sides.push((side, b));
-        }
+        let (grid, sides) = side_picker(&saved.side);
         content.append(&grid);
-        let labels: Vec<&str> = ALIGNMENTS.iter().map(|(_, l)| *l).collect();
-        let align = gtk::DropDown::from_strings(&labels);
-        align.set_selected(
-            ALIGNMENTS
-                .iter()
-                .position(|(a, _)| *a == saved.alignment)
-                .unwrap_or(0) as u32,
-        );
+        let align = alignment_picker(&saved.alignment);
         // Only a screen in use lines up along the side; the pointer crosses
         // anywhere along it.
         align.set_visible(then != Then::Control);
@@ -553,12 +577,8 @@ impl Controller {
                 return;
             }
             let settings = Settings {
-                side: sides
-                    .iter()
-                    .find(|(_, b)| b.is_active())
-                    .map_or("right", |(s, _)| *s)
-                    .into(),
-                alignment: ALIGNMENTS[(align.selected() as usize).min(2)].0.into(),
+                side: picked_side(&sides).into(),
+                alignment: picked_alignment(&align).into(),
                 sound: saved.sound,
             };
             let mut config = Config::load(&ui.config_path);
