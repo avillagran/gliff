@@ -41,6 +41,8 @@ const MAX_FPS: u64 = 30;
 /// How long a new client's first update waits for a frame captured after
 /// it connected, rather than one from before.
 const FIRST_FRAME_WAIT: Duration = Duration::from_millis(250);
+/// How often the output's mode is checked against the one it was given.
+const MODE_CHECK: Duration = Duration::from_secs(2);
 /// How long a client may take to log in.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 /// The wait before a client hears its password was wrong. With at most
@@ -117,6 +119,8 @@ pub async fn run(cfg: session::Config, vnc: Config) -> Result<()> {
     let handshakes = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let mut terminate = signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut hangup = signal(tokio::signal::unix::SignalKind::hangup())?;
+    let mut mode_check = tokio::time::interval(MODE_CHECK);
+    mode_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         let wants_frame = server.wants_frame();
         let stale_until = server.client.as_ref().and_then(Client::stale_until);
@@ -176,6 +180,10 @@ pub async fn run(cfg: session::Config, vnc: Config) -> Result<()> {
                 if let Err(e) = server.send_update().await {
                     server.drop_client(&format!("{e:#}"));
                 }
+            }
+            // The screen outlives config reloads, which drop its mode.
+            _ = mode_check.tick() => {
+                server.served.output.restore_mode(&instance);
             }
             _ = tokio::signal::ctrl_c() => break,
             _ = terminate.recv() => break,
