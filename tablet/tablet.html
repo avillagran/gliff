@@ -64,6 +64,9 @@ var connected = false;
 var retryTimer = null;
 var authFailed = false;
 var replaced = false;     // another viewer took the screen
+var settingsChanged = false;  // the bridge closed us to apply new settings
+var settings = { colors: "full", fps: 0 };  // from gliff's tablet dialog
+var frameTimer = null;
 
 function store(name, value) {
   try { if (value === null) localStorage.removeItem(name); else localStorage.setItem(name, value); } catch (e) {}
@@ -140,25 +143,64 @@ function buttons() {
 // noVNC 0.6 drops its socket handlers once a connection closes, so each
 // connection gets a client of its own.
 function newClient() {
-  return new RFB({ target: $D("noVNC_canvas"), encrypt: false, true_color: true,
+  // 256 colors: one byte a pixel from the server's palette, a quarter of
+  // what full color takes to send and to draw.
+  return new RFB({ target: $D("noVNC_canvas"), encrypt: false,
+                   true_color: settings.colors !== "256",
                    local_cursor: false, shared: true, view_only: false,
                    onUpdateState: onState,
                    onFBResize: function () { setTimeout(layout, 0); },
                    onPasswordRequired: function (r) { store(KEY, null); r.sendPassword(password()); } });
 }
 
+function busy() {
+  return rfb && !(rfb._rfb_state in { disconnected: 1, failed: 1, fatal: 1 });
+}
+
 function connect() {
   clearTimeout(retryTimer);
-  if (!wanted || !screenOn || connected || document.hidden) return;
+  settingsChanged = false;
+  if (!wanted || !screenOn || connected || document.hidden || busy()) return;
   message(null);
-  var port = window.location.port || (window.location.protocol === "https:" ? 443 : 80);
-  rfb = newClient();
-  rfb.connect(window.location.hostname, port, password(), "websockify?v=2");
+  request("GET", "/settings", null, function (code, text) {
+    if (code === 200) {
+      var lines = text.split("\n");
+      for (var i = 0; i < lines.length; i++) {
+        var kv = lines[i].split("=");
+        if (kv[0] === "colors") settings.colors = kv[1];
+        if (kv[0] === "fps") settings.fps = parseInt(kv[1], 10) || 0;
+      }
+    }
+    if (!wanted || !screenOn || connected || document.hidden || busy()) return;
+    clearTimeout(frameTimer);
+    var port = window.location.port || (window.location.protocol === "https:" ? 443 : 80);
+    rfb = newClient();
+    rfb.connect(window.location.hostname, port, password(), "websockify?v=2");
+  });
 }
 
 function retrySoon() {
   clearTimeout(retryTimer);
-  if (wanted && screenOn) retryTimer = setTimeout(connect, 2000);
+  if (wanted && screenOn) retryTimer = setTimeout(connect, settingsChanged ? 200 : 2000);
+}
+
+// noVNC asks for the next frame as soon as it has drawn one. With a frame
+// rate set, hold that request back: the server gathers the changes in
+// between, and the tablet has time to answer touches.
+function limitFrames() {
+  var send = RFB.messages.fbUpdateRequests, last = 0;
+  RFB.messages.fbUpdateRequests = function (sock, cleanDirty, width, height) {
+    clearTimeout(frameTimer);
+    var wait = settings.fps > 0 ? 1000 / settings.fps - (Date.now() - last) : 0;
+    if (wait <= 0) {
+      last = Date.now();
+      return send(sock, cleanDirty, width, height);
+    }
+    frameTimer = setTimeout(function () {
+      last = Date.now();
+      try { send(sock, cleanDirty, width, height); sock.flush(); } catch (e) {}
+    }, wait);
+  };
 }
 
 function onState(r, state, oldstate, msg) {
@@ -172,6 +214,10 @@ function onState(r, state, oldstate, msg) {
     status("Wrong password");
     message("Wrong password.", "Try Again", function () { authFailed = false; wanted = true; buttons(); connect(); });
   }
+  else if (state === "failed" && msg && /settings/.test(msg)) {
+    settingsChanged = true;
+    status("Applying new settings…");
+  }
   else if (state === "failed" && msg && /replaced/.test(msg)) {
     wanted = false;
     replaced = true;
@@ -179,7 +225,7 @@ function onState(r, state, oldstate, msg) {
     message("Another device took the screen.", "Connect Here", function () { replaced = false; wanted = true; buttons(); connect(); });
   }
   else if (state === "disconnected") {
-    if (!replaced && !authFailed) status(wanted ? "Reconnecting…" : "Disconnected");
+    if (!replaced && !authFailed && !settingsChanged) status(wanted ? "Reconnecting…" : "Disconnected");
     if (!wanted && !authFailed && !replaced) message("Disconnected.", "Connect", toggleConnect);
     retrySoon();
   }
@@ -196,9 +242,9 @@ function toggleConnect() {
   else { clearTimeout(retryTimer); if (connected) rfb.disconnect(); else onState(null, "disconnected"); }
 }
 
-function request(method, body, done) {
+function request(method, path, body, done) {
   var x = new XMLHttpRequest();
-  x.open(method, "/screen", true);
+  x.open(method, path, true);
   x.onreadystatechange = function () { if (x.readyState === 4) done(x.status, x.responseText.replace(/\s+$/, "")); };
   x.send(body || null);
 }
@@ -215,7 +261,7 @@ function toggleScreen() {
   $D("screenToggle").disabled = true;
   if (action === "off") { wanted = false; clearTimeout(retryTimer); if (connected) rfb.disconnect(); }
   status(action === "on" ? "Putting the screen back…" : "Removing the screen…");
-  request("POST", action + "\n" + pw, function (code, text) {
+  request("POST", "/screen", action + "\n" + pw, function (code, text) {
     $D("screenToggle").disabled = false;
     if (code === 403) { store(KEY, null); status("Wrong password"); return; }
     if (code !== 200) { status("Error: " + (text || code)); return; }
@@ -258,7 +304,8 @@ window.onscriptsload = function () {
   $D("connect").onclick = toggleConnect;
   $D("screenToggle").onclick = toggleScreen;
   layout();
-  request("GET", null, function (code, text) {
+  limitFrames();
+  request("GET", "/screen", null, function (code, text) {
     screenOn = (code !== 200) || text === "active" || text === "activating";
     buttons();
     if (screenOn) connect(); else showScreenOff();

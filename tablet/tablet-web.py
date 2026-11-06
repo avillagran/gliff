@@ -1,5 +1,6 @@
 """Serve the tablet page and bridge it to the local VNC server.
 
+GET /settings gives the page its colors and frame rate from tablet.env.
 GET /screen tells whether the Gliff screen is up; POST /screen with
 "on\n<password>" or "off\n<password>" puts it up or takes it away by
 starting or stopping the gliff-tablet-vnc user unit.
@@ -14,6 +15,7 @@ from websockify.websocketproxy import ProxyRequestHandler, WebSocketProxy
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PASSWORD_FILE = os.path.expanduser("~/.config/gliff/vnc-password")
+SETTINGS_FILE = os.path.expanduser("~/.config/gliff/tablet.env")
 UNIT = "gliff-tablet-vnc.service"
 # The newest viewer holds the screen. Each connection runs in a process of
 # its own, so the newest one is named in a file the others watch.
@@ -23,6 +25,29 @@ LATEST = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "gliff-tablet-l
 def password():
     with open(PASSWORD_FILE, encoding="utf-8") as f:
         return f.readline().rstrip("\n")[:8]
+
+
+def page_settings():
+    """The page's part of tablet.env, as `key=value` lines."""
+    values = {"colors": "full", "fps": "0"}
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            for line in f:
+                key, _, value = line.strip().partition("=")
+                if key == "GLIFF_TABLET_COLORS" and value in ("full", "256"):
+                    values["colors"] = value
+                elif key == "GLIFF_TABLET_FPS" and value in ("0", "5", "10", "15"):
+                    values["fps"] = value
+    except OSError:
+        pass
+    return "\n".join("%s=%s" % kv for kv in values.items())
+
+
+def settings_stamp():
+    try:
+        return os.stat(SETTINGS_FILE).st_mtime_ns
+    except OSError:
+        return 0
 
 
 def state():
@@ -38,6 +63,7 @@ class Handler(ProxyRequestHandler):
         if "v=2" not in self.path:
             raise self.CClose(4003, "old page, reload it")
         self.viewer = "%d-%d" % (os.getpid(), time.monotonic_ns())
+        self.stamp = settings_stamp()
         with open(LATEST, "w", encoding="utf-8") as f:
             f.write(self.viewer)
         try:
@@ -63,6 +89,10 @@ class Handler(ProxyRequestHandler):
         # reason the page reads so it stops reconnecting.
         if self.replaced():
             raise self.CClose(4001, "replaced")
+        # New colors or frame rate take a new connection: the page asks for
+        # its pixel format when it connects.
+        if settings_stamp() != self.stamp:
+            raise self.CClose(4002, "settings")
 
     def reply(self, code, text):
         body = (text + "\n").encode()
@@ -82,6 +112,8 @@ class Handler(ProxyRequestHandler):
         path = self.path.split("?")[0]
         if path == "/screen":
             return self.reply(200, state())
+        if path == "/settings":
+            return self.reply(200, page_settings())
         if path == "/":
             # Served in place, not redirected: iOS 8 Safari drops the
             # #fragment, which carries the password, across a redirect.
