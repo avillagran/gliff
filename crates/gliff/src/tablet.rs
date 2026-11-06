@@ -31,14 +31,31 @@ const SIZES: [(&str, &str); 4] = [
     ("1280x800", "1280 × 800"),
     ("1920x1080", "1920 × 1080"),
 ];
+/// Colors the page asks for: 4 bytes a pixel, or 1 from a palette of 256,
+/// which an old tablet receives and draws much faster.
+const COLORS: [(&str, &str); 2] = [
+    ("full", "Full color"),
+    ("256", "256 colors, faster on an old tablet"),
+];
+/// How often the page asks for a new frame; 0 is as often as it keeps up.
+/// Fewer frames leave an old tablet time to answer touches.
+const RATES: [(&str, &str); 4] = [
+    ("0", "As many frames as the tablet keeps up with"),
+    ("15", "15 frames a second"),
+    ("10", "10 frames a second"),
+    ("5", "5 frames a second"),
+];
 
-/// Where the tablet's screen stands and how big it is, kept in
-/// `tablet.env` next to the config, which the VNC unit reads too.
+/// Where the tablet's screen stands, how big it is, and how the page shows
+/// it, kept in `tablet.env` next to the config: the VNC unit reads the
+/// screen's part, and the page's bridge serves the rest to the page.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
     pub side: String,
     pub alignment: String,
     pub size: String,
+    pub colors: String,
+    pub rate: String,
 }
 
 impl Default for Settings {
@@ -47,6 +64,8 @@ impl Default for Settings {
             side: "right".into(),
             alignment: "center".into(),
             size: SIZES[0].0.into(),
+            colors: COLORS[0].0.into(),
+            rate: RATES[0].0.into(),
         }
     }
 }
@@ -68,6 +87,12 @@ impl Settings {
                     settings.alignment = value.into()
                 }
                 "GLIFF_TABLET_SIZE" if valid_size(value) => settings.size = value.into(),
+                "GLIFF_TABLET_COLORS" if COLORS.iter().any(|(c, _)| *c == value) => {
+                    settings.colors = value.into()
+                }
+                "GLIFF_TABLET_FPS" if RATES.iter().any(|(r, _)| *r == value) => {
+                    settings.rate = value.into()
+                }
                 _ => {}
             }
         }
@@ -77,9 +102,16 @@ impl Settings {
     pub fn render(&self) -> String {
         format!(
             "# Written by gliff's tablet dialog; read by {VNC_UNIT}.\n\
-             GLIFF_TABLET_POSITION={}\nGLIFF_TABLET_ALIGN={}\nGLIFF_TABLET_SIZE={}\n",
-            self.side, self.alignment, self.size
+             GLIFF_TABLET_POSITION={}\nGLIFF_TABLET_ALIGN={}\nGLIFF_TABLET_SIZE={}\n\
+             GLIFF_TABLET_COLORS={}\nGLIFF_TABLET_FPS={}\n",
+            self.side, self.alignment, self.size, self.colors, self.rate
         )
+    }
+
+    /// Whether the screen itself, rather than how the page shows it, is
+    /// unchanged.
+    fn same_screen(&self, other: &Self) -> bool {
+        self.side == other.side && self.alignment == other.alignment && self.size == other.size
     }
 
     fn load(path: &Path) -> Self {
@@ -96,6 +128,28 @@ impl Settings {
         std::fs::write(&tmp, self.render())?;
         std::fs::rename(&tmp, path)
     }
+}
+
+/// A labelled drop-down in row `row` of `grid`, with `value` selected.
+fn choice(
+    grid: &gtk::Grid,
+    row: i32,
+    label: &str,
+    options: &[(&str, &str)],
+    value: &str,
+) -> gtk::DropDown {
+    let labels: Vec<&str> = options.iter().map(|(_, l)| *l).collect();
+    let dropdown = gtk::DropDown::from_strings(&labels);
+    dropdown.set_hexpand(true);
+    dropdown.set_selected(options.iter().position(|(v, _)| *v == value).unwrap_or(0) as u32);
+    let label = gtk::Label::builder().label(label).xalign(0.0).build();
+    grid.attach(&label, 0, row, 1, 1);
+    grid.attach(&dropdown, 1, row, 1, 1);
+    dropdown
+}
+
+fn picked(options: &[(&'static str, &str)], dropdown: &gtk::DropDown) -> &'static str {
+    options[(dropdown.selected() as usize).min(options.len() - 1)].0
 }
 
 /// `WIDTHxHEIGHT` with both even and within what a screen can be.
@@ -279,15 +333,14 @@ impl Tablet {
         content.append(&grid);
         let align = alignment_picker(&saved.alignment);
         content.append(&align);
-        let labels: Vec<&str> = SIZES.iter().map(|(_, l)| *l).collect();
-        let size = gtk::DropDown::from_strings(&labels);
-        size.set_selected(
-            SIZES
-                .iter()
-                .position(|(s, _)| *s == saved.size)
-                .unwrap_or(0) as u32,
-        );
-        content.append(&size);
+        let choices = gtk::Grid::builder()
+            .row_spacing(6)
+            .column_spacing(12)
+            .build();
+        let size = choice(&choices, 0, "Size", &SIZES, &saved.size);
+        let colors = choice(&choices, 1, "Colors", &COLORS, &saved.colors);
+        let rate = choice(&choices, 2, "Frames", &RATES, &saved.rate);
+        content.append(&choices);
         dialog.set_extra_child(Some(&content));
 
         dialog.add_response("close", "Close");
@@ -306,10 +359,14 @@ impl Tablet {
         let settings = Settings {
             side: picked_side(&sides).into(),
             alignment: picked_alignment(&align).into(),
-            size: SIZES[(size.selected() as usize).min(SIZES.len() - 1)]
-                .0
-                .into(),
+            size: picked(&SIZES, &size).into(),
+            colors: picked(&COLORS, &colors).into(),
+            rate: picked(&RATES, &rate).into(),
         };
+        // Colors and frames are the page's: the bridge sees the file change
+        // and has the page connect again with them, while the screen and
+        // its windows stay where they are.
+        let restart = !on || !settings.same_screen(&saved);
         let failure = match response.as_str() {
             "start" if on && settings == saved => None,
             "start" => match settings.save(&self.env_path()) {
@@ -318,6 +375,7 @@ impl Tablet {
                 // can put the screen back by itself.
                 Ok(()) => match systemctl(&["start", WEB_UNIT]).await {
                     (false, why) => Some(why),
+                    (true, _) if !restart => None,
                     (true, _) => match systemctl(&["restart", VNC_UNIT]).await {
                         (false, why) => Some(why),
                         (true, _) => None,
@@ -349,14 +407,35 @@ mod tests {
             side: "below".into(),
             alignment: "end".into(),
             size: "1280x800".into(),
+            colors: "256".into(),
+            rate: "10".into(),
         };
         assert_eq!(Settings::parse(&s.render()), s);
     }
 
     #[test]
     fn unknown_or_missing_values_keep_the_defaults() {
-        let s = Settings::parse("GLIFF_TABLET_POSITION=sideways\nGLIFF_TABLET_SIZE=13x7\njunk\n");
+        let s = Settings::parse(
+            "GLIFF_TABLET_POSITION=sideways\nGLIFF_TABLET_SIZE=13x7\nGLIFF_TABLET_COLORS=16\n\
+             GLIFF_TABLET_FPS=7\njunk\n",
+        );
         assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn only_the_screen_part_needs_a_new_screen() {
+        let saved = Settings::default();
+        let page_only = Settings {
+            colors: "256".into(),
+            rate: "5".into(),
+            ..Settings::default()
+        };
+        assert!(page_only.same_screen(&saved));
+        let moved = Settings {
+            side: "left".into(),
+            ..Settings::default()
+        };
+        assert!(!moved.same_screen(&saved));
     }
 
     #[test]

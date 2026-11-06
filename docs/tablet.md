@@ -28,6 +28,22 @@ next to this computer's, its size, and the address to open on the tablet,
 with a button that copies it. Start Screen starts both units; they keep
 running while gliff's window is closed.
 
+Two choices there help an old tablet keep up:
+
+- Colors: 256 colors send one byte a pixel instead of four, from the
+  server's palette.
+- Frames: 15, 10 or 5 a second space out the page's requests for a new
+  frame; the server gathers the changes in between, and the tablet has
+  time left to answer touches.
+
+The page connects again with them as soon as they are saved. Changing the
+side, alignment or size restarts the screen instead, and its windows move
+to the other screens.
+
+The server keeps the screen's mode: a Hyprland config reload, which Omarchy
+does when a monitor comes or goes, drops it, and the server sets it back
+within two seconds.
+
 On the tablet, open the address. On an iPad, add it to the Home Screen
 (Share, then Add to Home Screen) and open it from that icon: Safari before
 iOS 12 cannot show a page full screen, but a Home Screen web app can. The
