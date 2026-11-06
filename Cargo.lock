@@ -759,7 +759,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-bridge"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "bytes",
  "gliff-proto",
@@ -876,7 +876,7 @@ dependencies = [
 
 [[package]]
 name = "gliff-vnc"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "des",
  "flate2",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "hypr-edge"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "calloop",
  "hypr-ipc",
