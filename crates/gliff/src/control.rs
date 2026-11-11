@@ -63,6 +63,17 @@ fn still_returning(returned: Option<(Instant, Side)>, side: Side, now: Instant) 
 pub struct Control {
     pub side: Side,
     pub host: String,
+    /// For a machine that runs RDP or RustDesk instead of gliff.
+    pub foreign: Option<Foreign>,
+}
+
+/// How to reach a machine that runs RDP or RustDesk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Foreign {
+    pub target: gliff_foreign::Target,
+    /// `None` until read from the keyring.
+    pub credentials: Option<gliff_foreign::Credentials>,
+    pub known_certificate: Option<String>,
 }
 
 /// `SIDE:HOST`, as `--control` takes it.
@@ -75,9 +86,18 @@ pub fn parse(text: &str) -> Result<Control, String> {
     if host.is_empty() {
         return Err(format!("{text:?} names no host"));
     }
+    let foreign = match gliff_foreign::Target::parse(host) {
+        Some(target) => Some(Foreign {
+            target: target?,
+            credentials: None,
+            known_certificate: None,
+        }),
+        None => None,
+    };
     Ok(Control {
         side,
         host: host.to_string(),
+        foreign,
     })
 }
 
@@ -174,6 +194,8 @@ struct Up {
     extent: Option<(f64, f64)>,
     /// Why the link went down, when it failed.
     error: Option<String>,
+    /// The machine refused the login; the link stopped trying.
+    refused: bool,
 }
 
 /// What a running control tells whoever started it.
@@ -183,6 +205,9 @@ pub enum Report {
     Connected { host: String },
     /// The machine cannot be reached now; gliff keeps trying.
     Disconnected { host: String, error: Option<String> },
+    /// An RDP or RustDesk machine refused the login: the control ended, and
+    /// asking again can help.
+    LoginRefused { host: String, error: String },
     /// The control ended, with why when it failed.
     Ended { error: Option<String> },
 }
@@ -352,6 +377,28 @@ pub fn run(
     hotkey: &str,
     share_clipboard: bool,
 ) -> anyhow::Result<()> {
+    let mut controls = controls.to_vec();
+    let config = crate::Config::load(&crate::Config::default_path());
+    for c in &mut controls {
+        let Some(f) = c.foreign.as_mut() else {
+            continue;
+        };
+        let saved = crate::secrets::load(&c.host)
+            .with_context(|| format!("read {}'s password from the keyring", c.host))?
+            .with_context(|| {
+                format!(
+                    "no password saved for {}: connect to it once from the window and \
+                     keep the password in the keyring",
+                    c.host
+                )
+            })?;
+        f.credentials = Some(gliff_foreign::Credentials {
+            user: saved.user,
+            password: saved.password,
+        });
+        f.known_certificate = config.certificates.get(&c.host).cloned();
+    }
+    let controls = controls.as_slice();
     let ended = async {
         let Ok(mut term) =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -440,6 +487,25 @@ fn drive(
         });
         let mut links = BTreeMap::new();
         for c in controls {
+            if let Some(foreign) = c.foreign.clone() {
+                let (to, from) = unbounded_channel();
+                tokio::task::spawn_local(foreign_link(
+                    c.side,
+                    c.host.clone(),
+                    foreign,
+                    up_tx.clone(),
+                    from,
+                ));
+                links.insert(
+                    c.side,
+                    Link {
+                        host: c.host.clone(),
+                        to,
+                        extent: None,
+                    },
+                );
+                continue;
+            }
             let mut target = SshTarget::new(c.host.clone());
             target.server_bin = server_bin.to_string();
             target.server_args = vec!["--control".into(), c.side.opposite().name().into()];
@@ -534,6 +600,13 @@ impl Controller {
                     up.side.name()
                 );
                 (self.report)(Report::Connected { host });
+            }
+            None if up.refused => {
+                tracing::warn!(%host, "login refused");
+                (self.report)(Report::LoginRefused {
+                    host,
+                    error: up.error.unwrap_or_else(|| "the login was refused".into()),
+                });
             }
             None => {
                 tracing::info!(%host, "not connected");
@@ -816,7 +889,78 @@ async fn link(
             side,
             extent: None,
             error,
+            refused: false,
         });
+        while out.try_recv().is_ok() {}
+        if started.elapsed() > STABLE {
+            delay = RETRY_FIRST;
+        }
+        tokio::time::sleep(delay).await;
+        delay = (delay * 2).min(RETRY_MAX);
+    }
+}
+
+/// Keep a connection to a machine that runs RDP or RustDesk, reconnecting
+/// with backoff, until its login is refused: trying a refused password
+/// again would only lock the account.
+async fn foreign_link(
+    side: Side,
+    host: String,
+    foreign: Foreign,
+    up: UnboundedSender<Up>,
+    mut out: UnboundedReceiver<ClientMsg>,
+) {
+    use gliff_foreign::{Error, Event, Purpose};
+    let Some(credentials) = foreign.credentials.clone() else {
+        let _ = up.send(Up {
+            side,
+            extent: None,
+            error: Some("no password given".into()),
+            refused: true,
+        });
+        return;
+    };
+    let mut delay = RETRY_FIRST;
+    loop {
+        let started = Instant::now();
+        let result = gliff_foreign::run(
+            &foreign.target,
+            &credentials,
+            Purpose::Control,
+            foreign.known_certificate.as_deref(),
+            &mut out,
+            &mut |e| match e {
+                Event::Connected { width, height, .. } | Event::Resized { width, height } => {
+                    let _ = up.send(Up {
+                        side,
+                        extent: Some((f64::from(width), f64::from(height))),
+                        error: None,
+                        refused: false,
+                    });
+                }
+                _ => {}
+            },
+        )
+        .await;
+        let (error, refused) = match result {
+            // The control stopped.
+            Ok(()) if out.is_closed() => return,
+            Ok(()) => (None, false),
+            Err(e @ (Error::Auth(_) | Error::CertificateChanged { .. })) => {
+                (Some(e.to_string()), true)
+            }
+            Err(Error::Other(e)) => (Some(format!("{e:#}")), false),
+        };
+        tracing::warn!(%host, error = ?error, "connection ended");
+        let _ = up.send(Up {
+            side,
+            extent: None,
+            error,
+            refused,
+        });
+        if refused {
+            return;
+        }
         while out.try_recv().is_ok() {}
         if started.elapsed() > STABLE {
             delay = RETRY_FIRST;
@@ -892,6 +1036,7 @@ async fn session(
         side,
         extent: Some(extent),
         error: None,
+        refused: false,
     });
     let (clip_out_tx, mut clip_out) = outbound_channel();
     shared.connected(
@@ -1075,9 +1220,17 @@ mod tests {
             parse("left:node@NODE.local").unwrap(),
             Control {
                 side: Side::Left,
-                host: "node@NODE.local".into()
+                host: "node@NODE.local".into(),
+                foreign: None,
             }
         );
+        let c = parse("right:rustdesk://pc").unwrap();
+        assert_eq!(c.host, "rustdesk://pc");
+        assert_eq!(
+            c.foreign.map(|f| f.target.kind),
+            Some(gliff_foreign::Kind::RustDesk)
+        );
+        assert!(parse("right:rdp://").is_err());
         assert!(parse("node@NODE.local").is_err());
         assert!(parse("middle:host").is_err());
         assert!(parse("right:").is_err());

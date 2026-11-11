@@ -1,5 +1,5 @@
 //! The client's network and decode worker: connect (TCP or ssh), run the
-//! protocol, decode the streams on the GPU, and hand finished display frames
+//! protocol (or RDP or RustDesk, through `gliff_foreign`), decode the streams on the GPU, and hand finished display frames
 //! (dmabufs) to the GTK thread. Input commands flow the other way.
 //!
 //! The Vulkan objects live entirely on this worker thread; only dmabuf fds
@@ -111,6 +111,11 @@ pub enum Status {
     /// ssh worked but the remote has no `gliff-server`, so retrying cannot
     /// help until gliff is installed there.
     ServerMissing,
+    /// An RDP or RustDesk machine refused the login: ask for it again.
+    AuthFailed(String),
+    /// An RDP machine showed a certificate no authority vouches for, for
+    /// the first time: its fingerprint, to keep.
+    NewCertificate(String),
     Closed,
 }
 
@@ -305,6 +310,28 @@ pub enum Endpoint {
     /// The protocol on this process's stdin and stdout (`--stdio`), named
     /// after the machine at the other end.
     Stdio(String),
+    /// A machine that runs RDP or RustDesk, by the name it is listed under.
+    Foreign {
+        name: String,
+        target: gliff_foreign::Target,
+    },
+}
+
+impl Endpoint {
+    /// Whether the machine is kept in the config, to reopen: those reached
+    /// by name, not a dev `--connect` address or a `--stdio` peer.
+    pub fn is_listed(&self) -> bool {
+        matches!(self, Endpoint::Ssh(_) | Endpoint::Foreign { .. })
+    }
+}
+
+/// What a foreign session logs in with.
+#[derive(Clone, Debug)]
+pub struct Login {
+    pub credentials: gliff_foreign::Credentials,
+    pub known_certificate: Option<String>,
+    /// The window's size in pixels, for an RDP screen to match.
+    pub size: (u16, u16),
 }
 
 /// The protocol's half of stdout, kept by [`take_stdio`] until the one
@@ -342,6 +369,8 @@ pub struct Worker {
     pub status: StdSender<Status>,
     pub input: UnboundedReceiver<ToWorker>,
     pub keymap: Keymap,
+    /// For a foreign endpoint, what to log in with.
+    pub login: Option<Login>,
 }
 
 impl Worker {
@@ -359,8 +388,29 @@ impl Worker {
         };
         let local = tokio::task::LocalSet::new();
         let status = self.status.clone();
+        if let Endpoint::Foreign { target, .. } = &self.endpoint {
+            let Some(login) = self.login.clone() else {
+                let _ = status.send(Status::AuthFailed("no password given".into()));
+                return;
+            };
+            let target = target.clone();
+            let ended = local.block_on(
+                &rt,
+                foreign_session(target, login, self.frames, status.clone(), self.input),
+            );
+            let _ = status.send(match ended {
+                Ok(()) => Status::Closed,
+                Err(gliff_foreign::Error::Auth(why)) => Status::AuthFailed(why),
+                Err(e @ gliff_foreign::Error::CertificateChanged { .. }) => {
+                    Status::Incompatible(e.to_string())
+                }
+                Err(gliff_foreign::Error::Other(e)) => Status::Error(format!("{e:#}")),
+            });
+            return;
+        }
         let result: anyhow::Result<()> = local.block_on(&rt, async move {
             match self.endpoint {
+                Endpoint::Foreign { .. } => unreachable!("handled above"),
                 Endpoint::Tcp(ref addr) => {
                     let stream = tokio::net::TcpStream::connect(addr).await?;
                     stream.set_nodelay(true)?;
@@ -435,6 +485,142 @@ impl Worker {
         } else {
             let _ = status.send(Status::Closed);
         }
+    }
+}
+
+/// Show and drive an RDP or RustDesk machine: its pictures arrive whole,
+/// in BGRX, and go to the window as CPU frames; the window's input goes to
+/// it as gliff messages.
+async fn foreign_session(
+    target: gliff_foreign::Target,
+    login: Login,
+    frames: SyncSender<Picture>,
+    status: StdSender<Status>,
+    mut input: UnboundedReceiver<ToWorker>,
+) -> Result<(), gliff_foreign::Error> {
+    use gliff_foreign::{Event, Purpose};
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    let zoom = Rc::new(Cell::new(1u32));
+    let (tx, mut rx) = unbounded_channel::<ClientMsg>();
+    let forward = {
+        let zoom = zoom.clone();
+        async move {
+            while let Some(msg) = input.recv().await {
+                match msg {
+                    ToWorker::Send(m) => {
+                        let _ = tx.send(m);
+                    }
+                    ToWorker::Zoom(z) => zoom.set(z),
+                    // The clipboard is not shared with these machines.
+                    _ => {}
+                }
+            }
+            // Dropping `tx` ends the session.
+        }
+    };
+    let pool = gliff_sw::PixelPool::default();
+    let cursor = LatestCursor::default();
+    let mut video = String::from("RDP");
+    let mut counted = (Instant::now(), 0u32);
+    let mut events = |e: Event| match e {
+        Event::Connected {
+            width,
+            height,
+            video: label,
+        } => {
+            video = label;
+            let _ = status.send(Status::Connected {
+                video: video.clone(),
+                view_width: width,
+                view_height: height,
+                fps_cap: 0,
+                headless: false,
+            });
+        }
+        Event::Resized { width, height } => {
+            let _ = status.send(Status::Connected {
+                video: video.clone(),
+                view_width: width,
+                view_height: height,
+                fps_cap: 0,
+                headless: false,
+            });
+        }
+        Event::Frame {
+            width,
+            height,
+            bgrx,
+        } => {
+            let frame = gliff_sw::BgraFrame {
+                width,
+                height,
+                pixels: bgrx,
+            }
+            .zoomed(clamp_zoom(zoom.get(), (width, height)), &pool);
+            // Latest wins: a full channel drops this picture, not the UI.
+            let _ = frames.try_send(Picture {
+                frame: Frame::Bgra(frame),
+                stream: (width, height),
+                view: (width, height),
+                scale_milli: 1000,
+            });
+            counted.1 += 1;
+            let elapsed = counted.0.elapsed();
+            if elapsed >= Duration::from_secs(1) {
+                let _ = status.send(Status::Stats {
+                    fps: counted.1 as f32 / elapsed.as_secs_f32(),
+                    mbit: 0.0,
+                    decode_ms: 0.0,
+                    video: video.clone(),
+                });
+                counted = (Instant::now(), 0);
+            }
+        }
+        Event::Cursor(c) => offer_cursor(
+            &cursor,
+            CursorShape {
+                width: c.width,
+                height: c.height,
+                hot_x: c.hot_x as i32,
+                hot_y: c.hot_y as i32,
+                argb: c.argb,
+            },
+            &status,
+        ),
+        // A shape with nothing visible: the window shows its own pointer.
+        Event::CursorHidden => offer_cursor(
+            &cursor,
+            CursorShape {
+                width: 1,
+                height: 1,
+                hot_x: 0,
+                hot_y: 0,
+                argb: vec![0; 4],
+            },
+            &status,
+        ),
+        Event::NewCertificate(fp) => {
+            let _ = status.send(Status::NewCertificate(fp));
+        }
+    };
+    let purpose = Purpose::View {
+        width: login.size.0,
+        height: login.size.1,
+    };
+    let run = gliff_foreign::run(
+        &target,
+        &login.credentials,
+        purpose,
+        login.known_certificate.as_deref(),
+        &mut rx,
+        &mut events,
+    );
+    tokio::pin!(run);
+    tokio::select! {
+        ended = &mut run => ended,
+        () = forward => run.await,
     }
 }
 

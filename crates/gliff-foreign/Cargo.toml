@@ -31,6 +31,8 @@ ironrdp-pdu = "0.11.0"
 ironrdp-core = "0.3.1"
 ironrdp-displaycontrol = "0.10.0"
 ironrdp-dvc = "0.10.0"
+ironrdp-svc = "0.10.0"
 
 [dev-dependencies]
+tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

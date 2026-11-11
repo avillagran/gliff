@@ -163,6 +163,14 @@ impl Controller {
                 c.note("Select a machine's tab first.");
                 return;
             };
+            if let Some(Ok(target)) = gliff_foreign::Target::parse(&name) {
+                c.note(&format!(
+                    "{name} runs {}, not gliff: it cannot show this computer's apps. \
+                     Control it with the mouse button instead.",
+                    target.kind.label()
+                ));
+                return;
+            }
             let saved = c.saved(&name);
             match saved.filter(Settings::valid) {
                 Some(settings) => c.start(name, &settings),
@@ -205,12 +213,13 @@ impl Controller {
         this
     }
 
-    /// The machine of the selected tab, when it is reached over ssh.
+    /// The machine of the selected tab, when it is reached by name: over
+    /// ssh, RDP or RustDesk.
     fn selected(&self) -> Option<String> {
         let ui = self.ui.upgrade()?;
         let active = ui.active.borrow();
         match active.as_ref() {
-            Some(s) => matches!(s.endpoint, crate::Endpoint::Ssh(_)).then(|| s.name.clone()),
+            Some(s) => s.endpoint.is_listed().then(|| s.name.clone()),
             None => self.chosen(),
         }
     }
@@ -424,7 +433,10 @@ impl Controller {
             .and_then(|n| self.driven.borrow().get(n).map(|d| d.sound.is_some()))
             .unwrap_or(false);
         self.syncing.set(true);
-        self.sound_button.set_visible(driving);
+        let foreign = selected
+            .as_deref()
+            .is_some_and(|n| gliff_foreign::Target::parse(n).is_some());
+        self.sound_button.set_visible(driving && !foreign);
         self.sound_button.set_active(playing);
         self.syncing.set(false);
         self.sound_button.set_icon_name(if playing {
@@ -647,8 +659,58 @@ impl Controller {
     /// Drive `name`, once its gliff-server can be, offering to update it
     /// when it is too old: left to fail, it would only retry for ever.
     fn start_control(self: &Rc<Self>, name: String, settings: &Settings) {
+        self.start_control_after(name, settings, None);
+    }
+
+    /// [`start_control`](Self::start_control); `refused` says why the last
+    /// login to an RDP or RustDesk machine was turned down.
+    fn start_control_after(
+        self: &Rc<Self>,
+        name: String,
+        settings: &Settings,
+        refused: Option<String>,
+    ) {
         if self.control_refused(&name, settings) || !self.checking.borrow_mut().insert(name.clone())
         {
+            return;
+        }
+        if let Some(target) = gliff_foreign::Target::parse(&name) {
+            let target = match target {
+                Ok(target) => target,
+                Err(why) => {
+                    self.checking.borrow_mut().remove(&name);
+                    self.note(&format!("Cannot control {name}: {why}"));
+                    return;
+                }
+            };
+            let settings = settings.clone();
+            let c = self.clone();
+            glib::spawn_future_local(async move {
+                let Some(ui) = c.ui.upgrade() else {
+                    return;
+                };
+                let credentials =
+                    crate::foreign_ui::credentials(&ui.window, &name, &target, refused.as_deref())
+                        .await;
+                c.checking.borrow_mut().remove(&name);
+                let Some(credentials) = credentials else {
+                    c.note(&format!("Not logged in to {name}."));
+                    return;
+                };
+                if c.control_refused(&name, &settings) {
+                    return;
+                }
+                let known_certificate = Config::load(&ui.config_path)
+                    .certificates
+                    .get(&name)
+                    .cloned();
+                let foreign = control::Foreign {
+                    target,
+                    credentials: Some(credentials),
+                    known_certificate,
+                };
+                c.drive(name, &settings, ui.cli.server_bin.clone(), Some(foreign));
+            });
             return;
         }
         self.note(&format!("Checking {name}…"));
@@ -659,7 +721,7 @@ impl Controller {
             c.checking.borrow_mut().remove(&name);
             if let Some(server_bin) = server_bin {
                 if !c.control_refused(&name, &settings) {
-                    c.drive(name, &settings, server_bin);
+                    c.drive(name, &settings, server_bin, None);
                 }
             }
         });
@@ -713,7 +775,13 @@ impl Controller {
         None
     }
 
-    fn drive(self: &Rc<Self>, name: String, settings: &Settings, server_bin: String) {
+    fn drive(
+        self: &Rc<Self>,
+        name: String,
+        settings: &Settings,
+        server_bin: String,
+        foreign: Option<control::Foreign>,
+    ) {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
@@ -725,6 +793,7 @@ impl Controller {
             vec![control::Control {
                 side,
                 host: name.clone(),
+                foreign: foreign.clone(),
             }],
             server_bin,
             ui.cli.release_hotkey.clone(),
@@ -750,7 +819,8 @@ impl Controller {
                 sound: None,
             },
         );
-        if settings.sound {
+        // Sound comes over ssh from a gliff machine only.
+        if settings.sound && foreign.is_none() {
             self.start_sound(&name);
         }
         // Showing that machine here as well would only take the pointer
@@ -773,7 +843,7 @@ impl Controller {
 
     /// Act on a report from `name`'s control run `id`; false once that run
     /// is over.
-    fn on_report(&self, name: &str, id: u64, report: Report) -> bool {
+    fn on_report(self: &Rc<Self>, name: &str, id: u64, report: Report) -> bool {
         let current = self.driven.borrow().get(name).is_some_and(|d| d.id == id);
         if !current {
             return !matches!(report, Report::Ended { .. });
@@ -794,6 +864,13 @@ impl Controller {
                         None => format!("{name} went away. Trying again…"),
                     });
                 }
+            }
+            Report::LoginRefused { error, .. } => {
+                self.stop_control(name);
+                if let Some(settings) = self.saved(name).filter(Settings::valid) {
+                    self.start_control_after(name.to_string(), &settings, Some(error));
+                }
+                return false;
             }
             Report::Ended { error } => {
                 self.driven.borrow_mut().remove(name);

@@ -31,8 +31,9 @@ use proto::message::Union;
 use proto::Message;
 use stream::{Cipher, Stream};
 
-/// How long the login may take.
-const LOGIN_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long the login may take: the other machine's user may have to
+/// accept the connection, or pick the screen to share on Wayland.
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// The client version gliff presents: one that sends keys by position.
 const CLIENT_VERSION: &str = "1.4.0";
 /// Frames a second asked for while only driving from the edge, where no
@@ -213,7 +214,9 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     })))
     .await?;
     loop {
-        match s.recv().await?.union {
+        let m = s.recv().await?;
+        tracing::debug!(message = ?m.union.as_ref().map(std::mem::discriminant), "while logging in");
+        match m.union {
             Some(Union::LoginResponse(r)) => match r.union {
                 Some(proto::login_response::Union::PeerInfo(p)) => return Ok(p),
                 Some(proto::login_response::Union::Error(e)) => {
