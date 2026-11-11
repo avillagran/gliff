@@ -240,7 +240,8 @@ machine drops.
 
 **Machines that run RDP or RustDesk.** A Windows PC, or any machine with a
 Remote Desktop server or RustDesk instead of gliff, gets a tab like the
-others: type `rdp://user@host` or `rustdesk://host` in the address bar. Its
+others: pick RDP or RustDesk from the badge at the start of the address bar
+and type the machine, or type `rdp://user@host` or `rustdesk://host`. Its
 tab shows its screen, and the mouse button drives it across the edge you
 pick for it, as with `--control`. gliff asks for the password once and keeps
 it in the desktop's keyring. A machine added as `user@host` that does not let
