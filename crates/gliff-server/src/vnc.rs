@@ -582,8 +582,15 @@ impl Server {
             if !self.served.is_headless() {
                 self.served.width = image.width as u32;
                 self.served.height = image.height as u32;
-                let _ = self.input().send(self.served.logical_extent());
             }
+            // The pointer covers what the viewer sees now, in the units
+            // Pointer events are divided into, even while a reload has
+            // the headless screen at another size for a moment.
+            let s = self.served.scale.max(0.5);
+            let _ = self.input().send(InputCmd::SetExtent {
+                width: (image.width as f32 / s).round().max(1.0) as u32,
+                height: (image.height as f32 / s).round().max(1.0) as u32,
+            });
             if !first {
                 if let Some(client) = &mut self.client {
                     if client.desktop_size {
