@@ -17,9 +17,10 @@ pub enum Protocol {
     Foreign(Kind),
 }
 
-const ALL: [Protocol; 3] = [
+const ALL: [Protocol; 4] = [
     Protocol::Ssh,
     Protocol::Foreign(Kind::Rdp),
+    Protocol::Foreign(Kind::Vnc),
     Protocol::Foreign(Kind::RustDesk),
 ];
 
@@ -41,6 +42,7 @@ impl Protocol {
             Protocol::Ssh => "SSH",
             Protocol::Foreign(Kind::Rdp) => "RDP",
             Protocol::Foreign(Kind::RustDesk) => "RustDesk",
+            Protocol::Foreign(Kind::Vnc) => "VNC",
         }
     }
 
@@ -54,7 +56,7 @@ impl Protocol {
 
     fn placeholder(self) -> &'static str {
         match self {
-            Protocol::Foreign(Kind::RustDesk) => "host",
+            Protocol::Foreign(Kind::RustDesk | Kind::Vnc) => "host",
             _ => "user@host",
         }
     }
@@ -198,6 +200,7 @@ mod tests {
 
     const RDP: Protocol = Protocol::Foreign(Kind::Rdp);
     const RUSTDESK: Protocol = Protocol::Foreign(Kind::RustDesk);
+    const VNC: Protocol = Protocol::Foreign(Kind::Vnc);
 
     #[test]
     fn the_picked_protocol_names_the_machine() {
@@ -205,6 +208,7 @@ mod tests {
         assert_eq!(address(RDP, "ann@pc"), "rdp://ann@pc");
         assert_eq!(address(RUSTDESK, "10.0.0.5"), "rustdesk://10.0.0.5");
         assert_eq!(address(RUSTDESK, "ann@10.0.0.5"), "rustdesk://10.0.0.5");
+        assert_eq!(address(VNC, "mac.local:1"), "vnc://mac.local:1");
     }
 
     #[test]

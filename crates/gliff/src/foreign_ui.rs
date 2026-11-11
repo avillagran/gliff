@@ -108,6 +108,10 @@ async fn ask(
                 "The permanent password set in {name}'s RustDesk. Its \"Enable direct IP \
                  access\" option must be on."
             ),
+            Kind::Vnc => format!(
+                "The VNC password set on {name}. Leave User empty unless its server asks \
+                 for one, as wayvnc does."
+            ),
         },
     };
     let dialog = adw::AlertDialog::new(Some(&format!("{} login", kind.label())), Some(&body));
@@ -187,6 +191,10 @@ pub async fn confirm_switch(window: &impl IsA<gtk::Widget>, name: &str, kind: Ki
             "{name} does not answer over ssh, but it runs RustDesk with direct IP access. \
              gliff can show it and control it through RustDesk instead, with its \
              permanent password."
+        ),
+        Kind::Vnc => format!(
+            "{name} does not answer over ssh, but it runs a VNC server. gliff can show it \
+             and control it through VNC instead, with its VNC password."
         ),
     };
     let dialog = adw::AlertDialog::new(Some(&format!("Use {}?", kind.label())), Some(&body));

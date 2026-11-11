@@ -154,14 +154,15 @@ The clipboard is shared with each machine in both directions, and
 this one, not another driven machine, and stops being available here if its
 machine drops.
 
-**Machines that run RDP or RustDesk.** A Windows PC, or any machine with a
-Remote Desktop server or RustDesk instead of gliff, gets a tab like the
-others: pick RDP or RustDesk from the badge at the start of the address bar
-and type the machine, or type `rdp://user@host` or `rustdesk://host`. Its
+**Machines that run RDP, VNC or RustDesk.** A Windows PC, a Mac, or any
+machine with a Remote Desktop server, a VNC server or RustDesk instead of
+gliff, gets a tab like the others: pick RDP, VNC or RustDesk from the badge
+at the start of the address bar and type the machine, or type
+`rdp://user@host`, `vnc://host` or `rustdesk://host`. Its
 tab shows its screen, and the mouse button drives it across the edge you
 pick for it, as with `--control`. gliff asks for the password once and keeps
 it in the desktop's keyring. A machine added as `user@host` that does not let
-ssh in is checked for both, and gliff offers to use what answers. See
+ssh in is checked for each, and gliff offers to use what answers. See
 [docs/foreign.md](docs/foreign.md) for what each needs and what to know about
 their security.
 

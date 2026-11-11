@@ -20,7 +20,7 @@ async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let text = args.next().unwrap_or_default();
     let target = Target::parse(&text)
-        .ok_or_else(|| anyhow::anyhow!("{text:?} is not rdp:// or rustdesk://"))?
+        .ok_or_else(|| anyhow::anyhow!("{text:?} is not rdp://, rustdesk:// or vnc://"))?
         .map_err(anyhow::Error::msg)?;
     let purpose = match args.next().as_deref() {
         Some("control") => Purpose::Control,

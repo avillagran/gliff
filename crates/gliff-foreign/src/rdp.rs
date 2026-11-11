@@ -5,7 +5,6 @@
 //! is kept by the caller and any other refused after, as ssh keeps host
 //! keys; one an authority vouches for is checked as usual.
 
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gliff_proto::{Axis, ClientMsg};
@@ -28,7 +27,6 @@ use ironrdp_pdu::rdp::client_info::{PerformanceFlags, TimezoneInfo};
 use ironrdp_session::image::DecodedImage;
 use ironrdp_session::{ActiveStage, ActiveStageBuilder, ActiveStageOutput};
 use ironrdp_tokio::{FramedWrite as _, TokioFramed};
-use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -170,14 +168,6 @@ impl ironrdp_tokio::NetworkClient for NoKdc {
     }
 }
 
-fn fingerprint(der: &[u8]) -> String {
-    Sha256::digest(der)
-        .iter()
-        .map(|b| format!("{b:02X}"))
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
 /// Why a connection failed, telling a refused login from the rest.
 fn connect_error(target: &Target, e: ConnectorError) -> Error {
     tracing::debug!(error = ?e, "RDP connection failed");
@@ -190,7 +180,7 @@ fn connect_error(target: &Target, e: ConnectorError) -> Error {
 }
 
 type Connected = (
-    TokioFramed<ironrdp_tls::TlsStream<TcpStream>>,
+    TokioFramed<crate::tls::TlsStream<TcpStream>>,
     ironrdp_connector::ConnectionResult,
     Option<String>,
 );
@@ -214,39 +204,8 @@ async fn connect(
         .await
         .map_err(|e| connect_error(target, e))?;
 
-    // Checked as usual first; a certificate no authority vouches for is
-    // taken when it is the one seen before, or the first.
-    let seen: Arc<Mutex<Option<String>>> = Arc::default();
-    let known = known_certificate.map(str::to_owned);
-    let callback: ironrdp_tls::CertificateValidationCallback = {
-        let seen = seen.clone();
-        Arc::new(move |der: &[u8], _endpoint: &str, why: &str| {
-            let fp = fingerprint(der);
-            tracing::debug!(fingerprint = %fp, %why, "RDP certificate not vouched for");
-            let ok = known.as_deref().is_none_or(|k| k.eq_ignore_ascii_case(&fp));
-            *seen.lock().unwrap_or_else(|e| e.into_inner()) = Some(fp);
-            ok
-        })
-    };
     let initial = framed.into_inner_no_leftover();
-    let upgraded =
-        ironrdp_tls::upgrade_with_certificate_validation_callback(initial, &target.host, callback)
-            .await;
-    let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let (tls, certificate) = match upgraded {
-        Ok(upgraded) => upgraded,
-        Err(e) => {
-            return Err(match (seen, known_certificate) {
-                (Some(seen), Some(known)) if !seen.eq_ignore_ascii_case(known) => {
-                    Error::CertificateChanged {
-                        host: target.host.clone(),
-                        seen,
-                    }
-                }
-                _ => Error::other(format!("TLS with {}: {e}", target.host)),
-            });
-        }
-    };
+    let (tls, certificate, seen) = crate::tls::upgrade(initial, target, known_certificate).await?;
     let server_public_key = ironrdp_tls::extract_tls_server_public_key(&certificate)
         .ok_or_else(|| Error::other("the server's certificate carries no public key"))?
         .to_owned();
@@ -307,7 +266,7 @@ pub(crate) async fn run(
     else {
         return Ok(());
     };
-    if let (Some(seen), None) = (seen, known_certificate) {
+    if let Some(seen) = seen {
         events(Event::NewCertificate(seen));
     }
     let factory =
@@ -660,7 +619,7 @@ mod tests {
 
     #[test]
     fn fingerprints_read_like_openssl() {
-        let fp = fingerprint(b"abc");
+        let fp = crate::tls::fingerprint(b"abc");
         assert!(fp.starts_with("BA:78:16:BF"));
         assert_eq!(fp.len(), 32 * 3 - 1);
     }
