@@ -14,6 +14,7 @@ mod keymap;
 mod monitor;
 mod net;
 mod paintable;
+mod protocol_badge;
 mod recent;
 mod remote_install;
 mod secrets;
@@ -138,6 +139,8 @@ struct App {
     add_revealer: gtk::Revealer,
     /// The address bar: Enter connects to the machine typed.
     entry: gtk::Entry,
+    /// At the start of the address bar: the protocol it connects by.
+    protocol: Rc<protocol_badge::ProtocolBadge>,
     transfers: Rc<clipboard_ui::TransferBars>,
     /// The last number given to a worker. Paste bars are keyed by it, so
     /// jobs of different connections never share a row.
@@ -453,6 +456,8 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .tooltip_text("Connect")
         .build();
     let address_bar = gtk::Box::builder().css_classes(["linked"]).build();
+    let protocol = protocol_badge::ProtocolBadge::new(&entry, &address_bar);
+    address_bar.append(protocol.widget());
     address_bar.append(&entry);
     address_bar.append(&connect_btn);
     let add_revealer = gtk::Revealer::builder()
@@ -585,6 +590,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         add_btn,
         add_revealer,
         entry: entry.clone(),
+        protocol,
         transfers,
         connections: Cell::new(0),
         sessions: RefCell::new(Vec::new()),
@@ -799,11 +805,12 @@ fn show_address_bar(ui: &App, show: bool) {
 /// Connect to the machine in the address bar, or switch to its tab when it
 /// is already connected.
 fn connect_from_address_bar(ui: &Rc<App>) {
-    let machine = ui.entry.text().trim().to_string();
-    if machine.is_empty() || ui.cli.stdio {
+    if ui.entry.text().trim().is_empty() || ui.cli.stdio {
         return;
     }
+    let machine = ui.protocol.address();
     ui.entry.set_text("");
+    ui.protocol.reset();
     match find_session(ui, &machine) {
         Some(s) => show_session(ui, &s),
         None => open_machine(ui, &machine),
@@ -818,6 +825,7 @@ fn connect_from_address_bar(ui: &Rc<App>) {
 /// hand focus back to the remote screen when there is one.
 fn cancel_address_edit(ui: &App) {
     ui.entry.set_text("");
+    ui.protocol.reset();
     show_address_bar(ui, false);
     if active(ui).is_some() {
         ui.video.grab_focus();
