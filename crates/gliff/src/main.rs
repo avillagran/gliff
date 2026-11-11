@@ -380,7 +380,7 @@ fn endpoints_from_cli(cli: &Cli) -> Vec<Endpoint> {
 }
 
 /// The endpoint for a machine by the name it is typed or listed under:
-/// `rdp://…` and `rustdesk://…` are foreign machines, anything else an ssh
+/// `rdp://…`, `vnc://…` and `rustdesk://…` are foreign machines, anything else an ssh
 /// host. `None`, with the reason, for a foreign address that does not parse.
 fn endpoint_for(cli: &Cli, name: &str) -> Result<Endpoint, String> {
     match gliff_foreign::Target::parse(name) {

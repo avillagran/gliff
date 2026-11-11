@@ -1,5 +1,5 @@
-//! Machines that run a Remote Desktop (RDP) server or RustDesk instead of
-//! gliff: tell them apart ([`probe`]), then show their screen and drive
+//! Machines that run a Remote Desktop (RDP) server, RustDesk or a VNC
+//! server instead of gliff: tell them apart ([`probe`]), then show their screen and drive
 //! them with the same input gliff sends its own servers ([`run`]).
 //!
 //! Input arrives as gliff's own [`ClientMsg`]: evdev key codes, pointer
@@ -16,12 +16,16 @@ use tokio::sync::mpsc::UnboundedReceiver;
 pub mod keys;
 pub mod rdp;
 pub mod rustdesk;
+mod tls;
+pub mod vnc;
 
 /// The port a Remote Desktop server listens on unless told otherwise.
 pub const RDP_PORT: u16 = 3389;
 /// The port RustDesk takes direct connections on, once its "Enable direct IP
 /// access" option is on.
 pub const RUSTDESK_PORT: u16 = 21118;
+/// The port of a VNC server's first display.
+pub const VNC_PORT: u16 = 5900;
 
 /// How long [`probe`] waits for each port.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
@@ -35,6 +39,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 pub enum Kind {
     Rdp,
     RustDesk,
+    Vnc,
 }
 
 impl Kind {
@@ -42,6 +47,7 @@ impl Kind {
         match self {
             Kind::Rdp => "rdp",
             Kind::RustDesk => "rustdesk",
+            Kind::Vnc => "vnc",
         }
     }
 
@@ -49,6 +55,7 @@ impl Kind {
         match self {
             Kind::Rdp => RDP_PORT,
             Kind::RustDesk => RUSTDESK_PORT,
+            Kind::Vnc => VNC_PORT,
         }
     }
 
@@ -57,17 +64,20 @@ impl Kind {
         match self {
             Kind::Rdp => "Remote Desktop (RDP)",
             Kind::RustDesk => "RustDesk",
+            Kind::Vnc => "VNC",
         }
     }
 
-    /// Whether it asks for a user name as well as a password.
+    /// Whether it can ask for a user name as well as a password: RDP
+    /// always, VNC under VeNCrypt.
     pub fn takes_user(self) -> bool {
-        self == Kind::Rdp
+        self != Kind::RustDesk
     }
 }
 
-/// A foreign machine, written `rdp://[user@]host[:port]` or
-/// `rustdesk://host[:port]`.
+/// A foreign machine, written `rdp://[user@]host[:port]`,
+/// `rustdesk://host[:port]` or `vnc://[user@]host[:port]`; a VNC port below
+/// 100 is a display number, `:1` being port 5901.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Target {
     pub kind: Kind,
@@ -84,7 +94,12 @@ impl Target {
         let kind = match scheme.to_ascii_lowercase().as_str() {
             "rdp" => Kind::Rdp,
             "rustdesk" => Kind::RustDesk,
-            _ => return Some(Err(format!("{scheme}:// is not rdp:// or rustdesk://"))),
+            "vnc" => Kind::Vnc,
+            _ => {
+                return Some(Err(format!(
+                    "{scheme}:// is not rdp://, rustdesk:// or vnc://"
+                )))
+            }
         };
         Some(Self::parse_rest(kind, rest))
     }
@@ -110,7 +125,11 @@ impl Target {
             kind,
             user,
             host,
-            port: port.unwrap_or(kind.default_port()),
+            port: match port {
+                Some(display) if kind == Kind::Vnc && display < 100 => VNC_PORT + display,
+                Some(port) => port,
+                None => kind.default_port(),
+            },
         })
     }
 
@@ -292,7 +311,7 @@ impl Error {
 /// Run a session with `target` until `input` closes or the other machine
 /// ends it, reporting through `events`.
 ///
-/// `known_certificate` is the RDP server certificate's fingerprint from an
+/// `known_certificate` is the RDP or VNC server certificate's fingerprint from an
 /// earlier [`Event::NewCertificate`], so a different one is refused.
 pub async fn run(
     target: &Target,
@@ -315,15 +334,30 @@ pub async fn run(
             .await
         }
         Kind::RustDesk => rustdesk::run(target, credentials, purpose, input, events).await,
+        Kind::Vnc => {
+            vnc::run(
+                target,
+                credentials,
+                purpose,
+                known_certificate,
+                input,
+                events,
+            )
+            .await
+        }
     }
 }
 
-/// What answers on `host`'s RDP and RustDesk ports, RDP first. Each answer
+/// What answers on `host`'s RDP, RustDesk and VNC ports, in that order. Each answer
 /// is checked to speak the protocol, so another service on the port does not
 /// count.
 pub async fn probe(host: &str) -> Option<Kind> {
-    let (rdp, rustdesk) = tokio::join!(probe_one(host, Kind::Rdp), probe_one(host, Kind::RustDesk));
-    rdp.or(rustdesk)
+    let (rdp, rustdesk, vnc) = tokio::join!(
+        probe_one(host, Kind::Rdp),
+        probe_one(host, Kind::RustDesk),
+        probe_one(host, Kind::Vnc)
+    );
+    rdp.or(rustdesk).or(vnc)
 }
 
 /// Wayland scroll units, 15 to a wheel notch, gathered into notches: a
@@ -393,6 +427,7 @@ async fn probe_one(host: &str, kind: Kind) -> Option<Kind> {
         match kind {
             Kind::Rdp => rdp::answers(stream).await,
             Kind::RustDesk => rustdesk::answers(stream).await,
+            Kind::Vnc => vnc::answers(stream).await,
         }
         .then_some(kind)
     })
@@ -425,7 +460,17 @@ mod tests {
         assert_eq!(t.address(), "[fe80::1]:3390");
 
         assert!(Target::parse("user@host").is_none());
-        assert!(Target::parse("vnc://host").unwrap().is_err());
+        assert!(Target::parse("ftp://host").unwrap().is_err());
+
+        let t = Target::parse("vnc://ann@mac.local:1").unwrap().unwrap();
+        assert_eq!((t.kind, t.port), (Kind::Vnc, 5901));
+        assert_eq!(t.user.as_deref(), Some("ann"));
+        let t = Target::parse("vnc://pc:5902").unwrap().unwrap();
+        assert_eq!(t.port, 5902);
+        assert_eq!(
+            Target::parse("vnc://pc").unwrap().unwrap().to_string(),
+            "vnc://pc"
+        );
         assert!(Target::parse("rdp://").unwrap().is_err());
         assert!(Target::parse("rdp://@host").unwrap().is_err());
         assert!(Target::parse("rdp://host:0").unwrap().is_err());

@@ -1,13 +1,16 @@
-# RDP and RustDesk machines
+# RDP, VNC and RustDesk machines
 
-gliff shows and drives machines that run a Remote Desktop (RDP) server or
-RustDesk instead of gliff. Their names carry the protocol:
+gliff shows and drives machines that run a Remote Desktop (RDP) server, a
+VNC server or RustDesk instead of gliff. Their names carry the protocol:
 
 ```
 rdp://user@host         # port 3389
 rdp://user@host:3390
 rustdesk://host         # port 21118, RustDesk's direct IP access
 rustdesk://192.168.1.9:21200
+vnc://host              # port 5900
+vnc://host:1            # display 1, port 5901
+vnc://user@host:5902    # a user, for servers that ask for one
 ```
 
 Type one in the address bar, or give it to `gliff` or to `--control`:
@@ -36,7 +39,7 @@ from the window once first.
 
 When a machine typed as `user@host` does not let ssh in (the connection is
 refused, times out, or the key is not accepted), gliff looks for an RDP
-server and for RustDesk on it, and offers to use what answers. Each answer
+server, RustDesk and a VNC server on it, and offers to use what answers. Each answer
 is checked to speak the protocol. Accepting renames the tab, keeping its
 place and screen side.
 
@@ -78,11 +81,34 @@ On Wayland, the RustDesk machine asks its user to pick the screen to share
 at each connection; gliff waits up to two minutes for that, or for the user
 to accept the connection when RustDesk is set to ask.
 
+## VNC
+
+Any VNC server: wayvnc, TigerVNC, x11vnc, a Mac's screen sharing with "VNC
+viewers may control screen with password" on, and the rest. gliff logs in
+with:
+
+- no password, when the server asks for none;
+- the VNC password, which servers check with DES over a challenge: it keeps
+  the password off the network, but nothing else is encrypted, and only its
+  first eight characters count;
+- VeNCrypt under TLS with a certificate, with a user and password (wayvnc
+  with `enable_auth`), the VNC password, or nothing. The certificate is kept
+  on first use, as RDP's.
+
+VeNCrypt's anonymous TLS and its user and password without TLS are not
+used: give the server a certificate. The picture comes as ZRLE, copied
+rectangles or raw pixels. Keys go by their position on the keyboard when the
+server takes QEMU's extended key events (wayvnc, TigerVNC, QEMU), as gliff's
+own do; otherwise as what a US keyboard types, so another layout's symbols
+can differ.
+
 ## Trying a machine without the window
 
 ```
 FOREIGN_PASSWORD=… cargo run -p gliff-foreign --example foreign-check -- \
     rdp://ann@office-pc view 10 frame.ppm
+FOREIGN_PASSWORD=… cargo run -p gliff-foreign --example foreign-check -- \
+    vnc://pc control 5
 ```
 
 prints what the host's ports answer, logs in, reports the screen and the

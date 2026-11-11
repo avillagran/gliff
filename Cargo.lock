@@ -1544,6 +1544,8 @@ dependencies = [
  "bytes",
  "crypto_box",
  "crypto_secretbox",
+ "des 0.8.1",
+ "flate2",
  "gliff-proto",
  "ironrdp-connector",
  "ironrdp-core",
@@ -1563,6 +1565,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "x509-cert",
 ]
 
 [[package]]
