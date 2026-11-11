@@ -25,7 +25,8 @@ the clipboard and "Use as a screen" need gliff on the other machine.
 
 gliff asks for the password the first time and, unless told not to, keeps it
 in the desktop's keyring through the Secret Service (gnome-keyring, KeePassXC
-or KWallet), under the machine's name. A refused password is asked for
+or KWallet), under the machine's name, once the machine has taken it: a
+mistyped password is never kept. A refused password is asked for
 again; driving from the edge stops after one refusal rather than retry and
 lock the account. Forgetting the machine's tab forgets its password. The
 command-line `--control` reads the password from the keyring, so connect

@@ -83,6 +83,8 @@ struct Driven {
     /// Its sound, while it plays here, with the id that tells this run's end
     /// from that of one stopped earlier.
     sound: Option<(u64, Rc<RefCell<Option<Sound>>>)>,
+    /// A login typed with "Remember" on, kept once the machine takes it.
+    remember_login: Option<gliff_foreign::Credentials>,
 }
 
 pub struct Controller {
@@ -689,11 +691,11 @@ impl Controller {
                 let Some(ui) = c.ui.upgrade() else {
                     return;
                 };
-                let credentials =
+                let login =
                     crate::foreign_ui::credentials(&ui.window, &name, &target, refused.as_deref())
                         .await;
                 c.checking.borrow_mut().remove(&name);
-                let Some(credentials) = credentials else {
+                let Some(login) = login else {
                     c.note(&format!("Not logged in to {name}."));
                     return;
                 };
@@ -704,12 +706,21 @@ impl Controller {
                     .certificates
                     .get(&name)
                     .cloned();
+                let remember = login.remember.then(|| login.credentials.clone());
                 let foreign = control::Foreign {
                     target,
-                    credentials: Some(credentials),
+                    credentials: Some(login.credentials),
                     known_certificate,
                 };
-                c.drive(name, &settings, ui.cli.server_bin.clone(), Some(foreign));
+                c.drive(
+                    name.clone(),
+                    &settings,
+                    ui.cli.server_bin.clone(),
+                    Some(foreign),
+                );
+                if let Some(d) = c.driven.borrow_mut().get_mut(&name) {
+                    d.remember_login = remember;
+                }
             });
             return;
         }
@@ -817,6 +828,7 @@ impl Controller {
                 handle,
                 connected: false,
                 sound: None,
+                remember_login: None,
             },
         );
         // Sound comes over ssh from a gliff machine only.
@@ -851,6 +863,14 @@ impl Controller {
         let shown = self.chosen().as_deref() == Some(name);
         match report {
             Report::Connected { .. } => {
+                let remember = self
+                    .driven
+                    .borrow_mut()
+                    .get_mut(name)
+                    .and_then(|d| d.remember_login.take());
+                if let Some(c) = remember {
+                    crate::foreign_ui::remember(name, &c);
+                }
                 self.set_connected(name, true);
                 if shown {
                     self.note(&self.control_status(name));

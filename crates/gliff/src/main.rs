@@ -223,6 +223,8 @@ struct Session {
     credentials: RefCell<Option<gliff_foreign::Credentials>>,
     /// The login is being asked for; a second ask waits for it.
     asking: Cell<bool>,
+    /// The login was typed with "Remember" on: keep it once it works.
+    remember_login: Cell<bool>,
     /// An ssh machine that did not answer was checked for RDP and RustDesk.
     probed: Cell<bool>,
 }
@@ -261,6 +263,7 @@ impl Session {
             stats: RefCell::new(String::new()),
             credentials: RefCell::new(None),
             asking: Cell::new(false),
+            remember_login: Cell::new(false),
             probed: Cell::new(false),
         }
     }
@@ -1531,8 +1534,9 @@ fn ask_login(ui: Rc<App>, s: Rc<Session>, refused: Option<String>) {
             return;
         }
         match credentials {
-            Some(credentials) => {
-                *s.credentials.borrow_mut() = Some(credentials);
+            Some(login) => {
+                *s.credentials.borrow_mut() = Some(login.credentials);
+                s.remember_login.set(login.remember);
                 start_session(ui, s);
             }
             None => {
@@ -1782,6 +1786,12 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     fps_cap,
                     headless,
                 } => {
+                    // A foreign machine took the login typed for it.
+                    if s.remember_login.replace(false) {
+                        if let Some(c) = s.credentials.borrow().as_ref() {
+                            foreign_ui::remember(&s.name, c);
+                        }
+                    }
                     s.server_view.set((view_width, view_height));
                     s.fps_cap.set(fps_cap);
                     s.headless.set(headless);
