@@ -9,12 +9,14 @@ mod clipboard;
 mod clipboard_ui;
 mod control;
 mod display;
+mod foreign_ui;
 mod keymap;
 mod monitor;
 mod net;
 mod paintable;
 mod recent;
 mod remote_install;
+mod secrets;
 mod sound;
 mod tablet;
 mod theme;
@@ -222,6 +224,12 @@ struct Session {
     cursor: RefCell<Option<gdk::Cursor>>,
     status: RefCell<String>,
     stats: RefCell<String>,
+    /// An RDP or RustDesk machine's login, once given.
+    credentials: RefCell<Option<gliff_foreign::Credentials>>,
+    /// The login is being asked for; a second ask waits for it.
+    asking: Cell<bool>,
+    /// An ssh machine that did not answer was checked for RDP and RustDesk.
+    probed: Cell<bool>,
 }
 
 impl Session {
@@ -256,6 +264,9 @@ impl Session {
             cursor: RefCell::new(None),
             status: RefCell::new(String::new()),
             stats: RefCell::new(String::new()),
+            credentials: RefCell::new(None),
+            asking: Cell::new(false),
+            probed: Cell::new(false),
         }
     }
 }
@@ -352,8 +363,36 @@ fn endpoints_from_cli(cli: &Cli) -> Vec<Endpoint> {
     }
     cli.host
         .iter()
-        .map(|host| ssh_endpoint(cli, host))
+        .filter_map(|host| match endpoint_for(cli, host) {
+            Ok(endpoint) => Some(endpoint),
+            Err(why) => {
+                tracing::error!(%host, %why, "cannot connect");
+                None
+            }
+        })
         .collect()
+}
+
+/// The endpoint for a machine by the name it is typed or listed under:
+/// `rdp://…` and `rustdesk://…` are foreign machines, anything else an ssh
+/// host. `None`, with the reason, for a foreign address that does not parse.
+fn endpoint_for(cli: &Cli, name: &str) -> Result<Endpoint, String> {
+    match gliff_foreign::Target::parse(name) {
+        Some(Ok(target)) => Ok(Endpoint::Foreign {
+            name: name.to_string(),
+            target,
+        }),
+        Some(Err(why)) => Err(why),
+        None => Ok(ssh_endpoint(cli, name)),
+    }
+}
+
+/// Open a session for `name`, or say why its address is unusable.
+fn open_machine(ui: &Rc<App>, name: &str) {
+    match endpoint_for(&ui.cli, name) {
+        Ok(endpoint) => open_session(ui, endpoint),
+        Err(why) => show_hint(ui, &format!("Cannot connect to {name}: {why}")),
+    }
 }
 
 fn ssh_endpoint(cli: &Cli, host: &str) -> Endpoint {
@@ -381,6 +420,7 @@ fn machine_name(endpoint: &Endpoint) -> &str {
     match endpoint {
         Endpoint::Ssh(t) => t.host.as_str(),
         Endpoint::Tcp(addr) | Endpoint::Stdio(addr) => addr.as_str(),
+        Endpoint::Foreign { name, .. } => name.as_str(),
     }
 }
 
@@ -685,7 +725,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     };
     let from_cli = endpoints_from_cli(cli);
     for machine in &config.open {
-        open_session(&ui, ssh_endpoint(cli, machine));
+        open_machine(&ui, machine);
     }
     for endpoint in from_cli.iter().cloned() {
         if find_session(&ui, machine_name(&endpoint)).is_none() {
@@ -792,7 +832,7 @@ fn connect_from_address_bar(ui: &Rc<App>) {
     ui.entry.set_text("");
     match find_session(ui, &machine) {
         Some(s) => show_session(ui, &s),
-        None => open_session(ui, ssh_endpoint(&ui.cli, &machine)),
+        None => open_machine(ui, &machine),
     }
     show_address_bar(ui, false);
     if active(ui).is_some() {
@@ -1169,7 +1209,7 @@ fn select_tab(ui: &Rc<App>, name: &str) {
             }
             show_session(ui, &s);
         }
-        None => open_session(ui, ssh_endpoint(&ui.cli, name)),
+        None => open_machine(ui, name),
     }
 }
 
@@ -1225,7 +1265,7 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
             ui.cli.no_clipboard,
             ui.local_clipboard.borrow().as_ref(),
         );
-        if matches!(s.endpoint, Endpoint::Ssh(_)) {
+        if s.endpoint.is_listed() {
             let mut config = Config::load(&ui.config_path);
             config.shown = Some(s.name.clone());
             save_config(ui, &config);
@@ -1281,7 +1321,7 @@ fn stop_session(ui: &Rc<App>, name: &str) {
     ui.transfers.clear_connection(s.conn.get());
     s.last_frame.borrow_mut().take();
     // A machine stopped by hand stays stopped when the window reopens.
-    if matches!(s.endpoint, Endpoint::Ssh(_)) {
+    if s.endpoint.is_listed() {
         let mut config = Config::load(&ui.config_path);
         config.set_open(&s.name, false);
         save_config(ui, &config);
@@ -1307,6 +1347,9 @@ fn stop_session(ui: &Rc<App>, name: &str) {
 fn forget_machine(ui: &Rc<App>, name: &str) {
     let mut config = Config::load(&ui.config_path);
     config.forget(name);
+    if gliff_foreign::Target::parse(name).is_some() {
+        foreign_ui::forget(name);
+    }
     save_config(ui, &config);
     refresh_tabs(ui);
 }
@@ -1389,6 +1432,25 @@ fn show_disconnected(ui: &Rc<App>, s: &Rc<Session>) {
 /// Start a worker for the session. Each call is a new generation; pollers
 /// and reconnects from an older one stop themselves.
 fn start_session(ui: Rc<App>, s: Rc<Session>) {
+    let login = match &s.endpoint {
+        Endpoint::Foreign { .. } => {
+            let Some(credentials) = s.credentials.borrow().clone() else {
+                ask_login(ui, s, None);
+                return;
+            };
+            let config = Config::load(&ui.config_path);
+            let (w, h) = ui.view_size.get();
+            Some(net::Login {
+                credentials,
+                known_certificate: config.certificates.get(&s.name).cloned(),
+                size: (
+                    u16::try_from(w).unwrap_or(1920).max(640),
+                    u16::try_from(h).unwrap_or(1080).max(480),
+                ),
+            })
+        }
+        _ => None,
+    };
     let (frame_tx, frame_rx) = sync_channel::<Picture>(2);
     let (status_tx, status_rx) = channel::<Status>();
     let (input_tx, input_rx) = unbounded_channel::<clipboard::ToWorker>();
@@ -1421,6 +1483,7 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
                 status: status_tx,
                 input: input_rx,
                 keymap,
+                login,
             }
             .run();
         })
@@ -1436,7 +1499,7 @@ const MAX_RETRIES: u32 = 5;
 /// reconnect when the window opens again, once per session. The connected
 /// status repeats on every stream reconfigure, such as a resize.
 fn remember_machine(ui: &Rc<App>, s: &Session) {
-    if !matches!(s.endpoint, Endpoint::Ssh(_)) || s.remembered.replace(true) {
+    if !s.endpoint.is_listed() || s.remembered.replace(true) {
         return;
     }
     let mut config = Config::load(&ui.config_path);
@@ -1476,6 +1539,92 @@ fn schedule_reconnect(ui: Rc<App>, s: Rc<Session>, generation: u64, error: Optio
     glib::timeout_add_local_once(Duration::from_millis(1500), move || {
         if s.generation.get() == generation {
             start_session(ui, s);
+        }
+    });
+}
+
+/// Get the login for a foreign session's machine, from the keyring or the
+/// user, then connect. `refused` says why the last one was turned down.
+fn ask_login(ui: Rc<App>, s: Rc<Session>, refused: Option<String>) {
+    let Endpoint::Foreign { target, .. } = &s.endpoint else {
+        return;
+    };
+    if s.asking.replace(true) {
+        return;
+    }
+    let target = target.clone();
+    let generation = s.generation.get();
+    set_status(&ui, &s, &format!("Logging in to {}…", s.name));
+    glib::spawn_future_local(async move {
+        let credentials =
+            foreign_ui::credentials(&ui.window, &s.name, &target, refused.as_deref()).await;
+        s.asking.set(false);
+        // Closed or restarted meanwhile.
+        let current = s.generation.get() == generation
+            && find_session(&ui, &s.name).is_some_and(|open| Rc::ptr_eq(&open, &s));
+        if !current {
+            return;
+        }
+        match credentials {
+            Some(credentials) => {
+                *s.credentials.borrow_mut() = Some(credentials);
+                start_session(ui, s);
+            }
+            None => {
+                s.gave_up.set(true);
+                set_status(
+                    &ui,
+                    &s,
+                    &format!("Not logged in to {} — click the tab to try again", s.name),
+                );
+            }
+        }
+    });
+}
+
+/// After an ssh machine failed to let ssh in, look for RDP and RustDesk on
+/// it, once, and offer to use what answers.
+fn probe_foreign(ui: Rc<App>, s: Rc<Session>) {
+    let Endpoint::Ssh(target) = &s.endpoint else {
+        return;
+    };
+    if s.probed.replace(true) || s.connected.get() {
+        return;
+    }
+    let host = target.host.clone();
+    glib::spawn_future_local(async move {
+        let Some(kind) = foreign_ui::probe(&host).await else {
+            return;
+        };
+        tracing::info!(machine = %s.name, kind = kind.label(), "found instead of ssh");
+        // It connected meanwhile, or the tab was closed.
+        if s.connected.get() || find_session(&ui, &s.name).is_none_or(|o| !Rc::ptr_eq(&o, &s)) {
+            return;
+        }
+        if !foreign_ui::confirm_switch(&ui.window, &s.name, kind).await {
+            return;
+        }
+        let target = match gliff_foreign::Target::from_ssh_host(kind, &host) {
+            Ok(target) => target,
+            Err(why) => {
+                set_status(&ui, &s, &why);
+                return;
+            }
+        };
+        let new_name = target.to_string();
+        let mut config = Config::load(&ui.config_path);
+        config.rename(&s.name, &new_name);
+        save_config(&ui, &config);
+        stop_session(&ui, &s.name);
+        match find_session(&ui, &new_name) {
+            Some(open) => show_session(&ui, &open),
+            None => open_session(
+                &ui,
+                Endpoint::Foreign {
+                    name: new_name,
+                    target,
+                },
+            ),
         }
     });
 }
@@ -1771,7 +1920,11 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                 }
                 Status::Error(e) => {
                     tracing::error!(machine = %s.name, error = %e, "connection failed");
+                    let unreachable = foreign_ui::ssh_unreachable(&e) && !s.connected.get();
                     show_disconnected(&ui, &s);
+                    if unreachable {
+                        probe_foreign(ui.clone(), s.clone());
+                    }
                     schedule_reconnect(ui.clone(), s.clone(), generation, Some(&e));
                     return glib::ControlFlow::Break;
                 }
@@ -1795,6 +1948,19 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     s.gave_up.set(true);
                     offer_install(ui.clone(), s.clone(), generation);
                     return glib::ControlFlow::Break;
+                }
+                Status::AuthFailed(why) => {
+                    tracing::warn!(machine = %s.name, %why, "login refused");
+                    show_disconnected(&ui, &s);
+                    s.credentials.borrow_mut().take();
+                    ask_login(ui.clone(), s.clone(), Some(why));
+                    return glib::ControlFlow::Break;
+                }
+                Status::NewCertificate(fingerprint) => {
+                    tracing::info!(machine = %s.name, %fingerprint, "keeping the RDP certificate");
+                    let mut config = Config::load(&ui.config_path);
+                    config.certificates.insert(s.name.clone(), fingerprint);
+                    save_config(&ui, &config);
                 }
                 Status::Closed => {
                     show_disconnected(&ui, &s);

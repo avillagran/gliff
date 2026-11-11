@@ -21,6 +21,10 @@ pub struct Config {
     /// The machine the window showed last.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shown: Option<String>,
+    /// The certificate each RDP machine showed first, by SHA-256: another
+    /// one is refused, as ssh refuses a changed host key.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub certificates: std::collections::BTreeMap<String, String>,
 }
 
 impl Config {
@@ -85,6 +89,7 @@ impl Config {
 
     pub fn forget(&mut self, machine: &str) {
         self.monitors.remove(machine);
+        self.certificates.remove(machine);
         self.machines.retain(|m| m != machine);
         self.set_open(machine, false);
         if self.shown.as_deref() == Some(machine) {
@@ -100,6 +105,31 @@ impl Config {
             self.open.push(machine.to_string());
         } else if !open {
             self.open.retain(|m| m != machine);
+        }
+    }
+
+    /// Call `old` by `new` from now on, in its place in the list and with
+    /// its settings, as when a machine turns out to run RDP or RustDesk.
+    pub fn rename(&mut self, old: &str, new: &str) {
+        if old == new {
+            return;
+        }
+        if self.machines.iter().any(|m| m == new) {
+            self.machines.retain(|m| m != old);
+        } else if let Some(m) = self.machines.iter_mut().find(|m| *m == old) {
+            *m = new.to_string();
+        }
+        if let Some(settings) = self.monitors.remove(old) {
+            self.monitors.entry(new.to_string()).or_insert(settings);
+        }
+        self.certificates.remove(old);
+        let was_open = self.open.iter().any(|m| m == old);
+        self.set_open(old, false);
+        if was_open {
+            self.set_open(new, true);
+        }
+        if self.shown.as_deref() == Some(old) {
+            self.shown = Some(new.to_string());
         }
     }
 
@@ -122,6 +152,25 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_renamed_machine_keeps_its_place_and_settings() {
+        let mut c = Config::default();
+        c.remember("a");
+        c.remember("pc");
+        c.remember("b");
+        c.set_open("pc", true);
+        c.shown = Some("pc".into());
+        c.monitors.insert("pc".into(), Default::default());
+        c.rename("pc", "rdp://pc");
+        assert_eq!(c.machines, ["a", "rdp://pc", "b"]);
+        assert_eq!(c.open, ["rdp://pc"]);
+        assert_eq!(c.shown.as_deref(), Some("rdp://pc"));
+        assert!(c.monitors.contains_key("rdp://pc") && !c.monitors.contains_key("pc"));
+        // Onto a name already listed, the old entry goes.
+        c.rename("a", "b");
+        assert_eq!(c.machines, ["rdp://pc", "b"]);
+    }
 
     #[test]
     fn remember_appends_new_machines_once() {

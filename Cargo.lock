@@ -1501,6 +1501,7 @@ dependencies = [
  "dbus",
  "drm-fourcc",
  "gliff-bridge",
+ "gliff-foreign",
  "gliff-proto",
  "gliff-sw",
  "gliff-transport",
@@ -1552,6 +1553,7 @@ dependencies = [
  "ironrdp-input",
  "ironrdp-pdu",
  "ironrdp-session",
+ "ironrdp-svc",
  "ironrdp-tls",
  "ironrdp-tokio",
  "prost",
@@ -1560,6 +1562,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

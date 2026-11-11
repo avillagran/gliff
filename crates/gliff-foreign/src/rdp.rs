@@ -96,7 +96,14 @@ fn config(credentials: &Credentials, size: DesktopSize) -> ironrdp_connector::Co
         dig_product_id: String::new(),
         desktop_size: size,
         monitor_layout: None,
-        bitmap: None,
+        // RemoteFX through surface commands, which some servers require
+        // (weston), besides the plain bitmaps every server sends.
+        bitmap: Some(ironrdp_connector::BitmapConfig {
+            lossy_compression: true,
+            color_depth: 32,
+            codecs: ironrdp_pdu::rdp::capability_sets::client_codecs_capabilities(&[])
+                .unwrap_or_default(),
+        }),
         client_build: 0,
         client_name: "gliff".into(),
         client_dir: "C:\\Windows\\System32\\mstscax.dll".into(),
@@ -129,6 +136,26 @@ fn config(credentials: &Credentials, size: DesktopSize) -> ironrdp_connector::Co
     }
 }
 
+/// The clipboard channel, present and silent: gliff shares no clipboard
+/// with these machines, but some servers end a session that lacks the
+/// channel (weston).
+#[derive(Debug)]
+struct NoClipboard;
+
+ironrdp_svc::impl_as_any!(NoClipboard);
+
+impl ironrdp_svc::SvcProcessor for NoClipboard {
+    fn channel_name(&self) -> ironrdp_pdu::gcc::ChannelName {
+        ironrdp_pdu::gcc::ChannelName::from_static(b"cliprdr\0")
+    }
+
+    fn process(&mut self, _payload: &[u8]) -> ironrdp_pdu::PduResult<Vec<ironrdp_svc::SvcMessage>> {
+        Ok(Vec::new())
+    }
+}
+
+impl ironrdp_svc::SvcClientProcessor for NoClipboard {}
+
 /// CredSSP asks for this only to reach a Kerberos KDC; gliff logs in with
 /// NTLM.
 struct NoKdc;
@@ -151,6 +178,7 @@ fn fingerprint(der: &[u8]) -> String {
 
 /// Why a connection failed, telling a refused login from the rest.
 fn connect_error(target: &Target, e: ConnectorError) -> Error {
+    tracing::debug!(error = ?e, "RDP connection failed");
     match e.kind() {
         ConnectorErrorKind::Credssp(_) | ConnectorErrorKind::AccessDenied => {
             Error::Auth(format!("{} refused the user name or password", target.host))
@@ -159,22 +187,19 @@ fn connect_error(target: &Target, e: ConnectorError) -> Error {
     }
 }
 
-pub(crate) async fn run(
+type Connected = (
+    TokioFramed<ironrdp_tls::TlsStream<TcpStream>>,
+    ironrdp_connector::ConnectionResult,
+    Option<String>,
+);
+
+/// Connect and log in with `config`: the session's stream, what the server
+/// agreed to, and the fingerprint of a certificate no authority vouches for.
+async fn connect(
     target: &Target,
-    credentials: &Credentials,
-    purpose: Purpose,
+    config: &ironrdp_connector::Config,
     known_certificate: Option<&str>,
-    input: &mut UnboundedReceiver<ClientMsg>,
-    events: &mut dyn FnMut(Event),
-) -> Result<(), Error> {
-    let size = match purpose {
-        Purpose::View { width, height } => DesktopSize {
-            width: width.clamp(200, 8192),
-            height: height.clamp(200, 8192),
-        },
-        Purpose::Control => CONTROL_SIZE,
-    };
-    let config = config(credentials, size);
+) -> Result<Connected, Error> {
     let stream = TcpStream::connect(target.address())
         .await
         .map_err(|e| Error::other(format!("connect to {}: {e}", target.address())))?;
@@ -183,7 +208,8 @@ pub(crate) async fn run(
         .local_addr()
         .map_err(|e| Error::other(format!("local address: {e}")))?;
     let mut framed = TokioFramed::new(stream);
-    let mut connector = ClientConnector::new(config.clone(), client_addr);
+    let mut connector =
+        ClientConnector::new(config.clone(), client_addr).with_static_channel(NoClipboard);
     let should_upgrade = ironrdp_tokio::connect_begin(&mut framed, &mut connector)
         .await
         .map_err(|e| connect_error(target, e))?;
@@ -221,11 +247,6 @@ pub(crate) async fn run(
             });
         }
     };
-    if let Some(seen) = seen {
-        if known_certificate.is_none() {
-            events(Event::NewCertificate(seen));
-        }
-    }
     let server_public_key = ironrdp_tls::extract_tls_server_public_key(&certificate)
         .ok_or_else(|| Error::other("the server's certificate carries no public key"))?
         .to_owned();
@@ -243,7 +264,46 @@ pub(crate) async fn run(
     .await
     .and_then(ironrdp_connector::ConnectionOutcome::into_connected)
     .map_err(|e| connect_error(target, e))?;
+    Ok((framed, result, seen))
+}
 
+pub(crate) async fn run(
+    target: &Target,
+    credentials: &Credentials,
+    purpose: Purpose,
+    known_certificate: Option<&str>,
+    input: &mut UnboundedReceiver<ClientMsg>,
+    events: &mut dyn FnMut(Event),
+) -> Result<(), Error> {
+    let size = match purpose {
+        Purpose::View { width, height } => DesktopSize {
+            width: width.clamp(200, 8192),
+            height: height.clamp(200, 8192),
+        },
+        Purpose::Control => CONTROL_SIZE,
+    };
+    let mut config = config(credentials, size);
+    let (framed, result, seen) = match connect(target, &config, known_certificate).await {
+        // Some servers offer NLA without a way to log in through it, and
+        // take the login over TLS alone (weston); one that requires NLA,
+        // as Windows does by default, refuses this second try, and the
+        // first refusal stands.
+        Err(Error::Auth(why)) => {
+            tracing::info!(host = %target.host, "NLA refused the login; trying TLS alone");
+            config.enable_credssp = false;
+            match connect(target, &config, known_certificate).await {
+                Ok(connected) => connected,
+                Err(e) => {
+                    tracing::debug!(error = %e, "TLS alone failed too");
+                    return Err(Error::Auth(why));
+                }
+            }
+        }
+        connected => connected?,
+    };
+    if let (Some(seen), None) = (seen, known_certificate) {
+        events(Event::NewCertificate(seen));
+    }
     let factory =
         ConnectionActivationFactory::new(config, result.io_channel_id, result.user_channel_id);
     let stage = ActiveStageBuilder {
