@@ -903,6 +903,20 @@ async fn link(
 /// Keep a connection to a machine that runs RDP or RustDesk, reconnecting
 /// with backoff, until its login is refused: trying a refused password
 /// again would only lock the account.
+/// Keep `fingerprint` as `host`'s certificate in the config, as the window
+/// does after showing it, so later runs refuse another.
+fn keep_certificate(host: &str, fingerprint: &str) {
+    tracing::info!(%host, %fingerprint, "keeping the certificate");
+    let path = crate::Config::default_path();
+    let mut config = crate::Config::load(&path);
+    config
+        .certificates
+        .insert(host.to_string(), fingerprint.to_string());
+    if let Err(e) = config.save(&path) {
+        tracing::warn!(error = %e, "cannot save the certificate");
+    }
+}
+
 async fn foreign_link(
     side: Side,
     host: String,
@@ -921,15 +935,20 @@ async fn foreign_link(
         return;
     };
     let mut delay = RETRY_FIRST;
+    // The certificate to hold the server to: the saved one, or the first
+    // one seen here, so a reconnect refuses another.
+    let mut known = foreign.known_certificate.clone();
     loop {
         let started = Instant::now();
+        let mut learned = None;
         let result = gliff_foreign::run(
             &foreign.target,
             &credentials,
             Purpose::Control,
-            foreign.known_certificate.as_deref(),
+            known.as_deref(),
             &mut out,
             &mut |e| match e {
+                Event::NewCertificate(fingerprint) => learned = Some(fingerprint),
                 Event::Connected { width, height, .. } | Event::Resized { width, height } => {
                     let _ = up.send(Up {
                         side,
@@ -942,6 +961,10 @@ async fn foreign_link(
             },
         )
         .await;
+        if let Some(fingerprint) = learned {
+            keep_certificate(&host, &fingerprint);
+            known = Some(fingerprint);
+        }
         let (error, refused) = match result {
             // The control stopped.
             Ok(()) if out.is_closed() => return,

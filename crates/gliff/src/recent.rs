@@ -61,7 +61,15 @@ impl Config {
             std::fs::create_dir_all(dir)?;
         }
         let text = toml::to_string(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, text)
+        // Written beside and renamed over, so the window and a control
+        // saving at once never leave, or read, half a file.
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(format!(".{}.tmp", std::process::id()));
+        let tmp = PathBuf::from(tmp);
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path).inspect_err(|_| {
+            let _ = std::fs::remove_file(&tmp);
+        })
     }
 
     fn parse(text: &str) -> Result<Self, toml::de::Error> {
