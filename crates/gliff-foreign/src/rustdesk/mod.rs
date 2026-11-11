@@ -1,13 +1,14 @@
 //! RustDesk by direct IP: the other machine must have "Enable direct IP
 //! access" on, and a permanent or one-time password.
 //!
-//! It opens by sending its identity with a key for this connection only;
-//! gliff seals a fresh secret to that key, and both ends encrypt with it
-//! from then on. Without RustDesk's rendezvous server there is no trusted
-//! copy of the machine's signing key to check the identity against, so this
-//! keeps the session from being read on the network, but not from a machine
-//! in the middle; the password itself never travels, only a hash salted by
-//! the other machine's challenge.
+//! RustDesk does not encrypt direct IP connections: its direct server skips
+//! the key exchange and opens with the login challenge, so the screen and
+//! the keys cross the network as they are. The password itself never
+//! travels, only a hash salted by the other machine's challenge. The login
+//! dialog says so before the password is typed. A server that does send
+//! its identity with a key (as RustDesk does through its rendezvous
+//! servers) gets a fresh secret sealed to that key, and both ends encrypt
+//! with it from then on.
 
 use std::time::Duration;
 
@@ -90,16 +91,6 @@ fn password_proof(password: &str, salt: &str, challenge: &str) -> Vec<u8> {
         .to_vec()
 }
 
-/// A machine that offers no key would take the password proof, the screen
-/// and the keys over plain TCP: gliff does not log in to it.
-fn unencrypted(target: &Target) -> Error {
-    Error::other(format!(
-        "{} offers no encryption key, so gliff does not log in to it: the login and \
-         everything after would cross the network unencrypted",
-        target.host
-    ))
-}
-
 fn login_error(target: &Target, error: &str) -> Error {
     match error {
         "Wrong Password" | "Empty Password" => {
@@ -180,7 +171,10 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
                     .await?;
                     s.cipher = Some(Cipher::new(&secret));
                 }
-                None => return Err(unencrypted(target)),
+                None => {
+                    tracing::warn!(host = %target.host, "RustDesk offered no key; unencrypted");
+                    s.send(&Message::default()).await?;
+                }
             }
             loop {
                 match s.recv().await?.union {
@@ -194,7 +188,11 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
         }
-        Some(Union::Hash(_)) => return Err(unencrypted(target)),
+        // RustDesk's direct IP access: no key exchange, no encryption.
+        Some(Union::Hash(h)) => {
+            tracing::debug!(host = %target.host, "RustDesk direct IP access: unencrypted");
+            h
+        }
         _ => {
             return Err(Error::other(format!(
                 "{} does not speak RustDesk",

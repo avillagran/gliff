@@ -68,20 +68,20 @@ until then: next time gliff asks for the new one. With no password, the
 machine asks its user to accept the connection.
 Its picture comes as VP9 or VP8, decoded with the system's libvpx.
 
-The connection is encrypted with a key made for it, but without a
-rendezvous server there is no trusted copy of the machine's identity to
-check, so a machine in the middle of the network could pose as it. The
-password itself never travels: only a hash, salted by the machine's own
-challenge.
+RustDesk does not encrypt direct IP connections: its direct server skips
+the key exchange it makes through its rendezvous servers, so the screen and
+the keys cross the network as they are, and nothing proves the machine is
+the one you meant. The password itself never travels, only a hash salted by
+the machine's own challenge. gliff's login dialog says so before the
+password is typed. Use direct IP access on your own network, or reach the
+machine through a VPN or an ssh tunnel.
 
-That encryption is also weaker than it looks. RustDesk's protocol uses one
-key in both directions, each side counting its messages from one, so a
-message each way shares a nonce; someone who records the connection can
-learn parts of one message from the other where either is predictable,
-such as the login or typed keys. gliff speaks the protocol as RustDesk does
-and cannot change that alone. A machine that offers no key at all is
-refused rather than logged in to without encryption. On a network you do
-not trust, reach a RustDesk machine through a VPN or an ssh tunnel.
+A server that does send its identity with a key gets an encrypted session.
+That encryption is weaker than it looks: RustDesk uses one key in both
+directions, each side counting its messages from one, so a message each way
+shares a nonce, and someone who records the connection can learn parts of
+one from the other where either is predictable. gliff speaks the protocol
+as RustDesk does and cannot change that alone.
 
 On Wayland, the RustDesk machine asks its user to pick the screen to share
 at each connection; gliff waits up to two minutes for that, or for the user

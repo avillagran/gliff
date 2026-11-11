@@ -106,7 +106,9 @@ async fn ask(
             Kind::Rdp => format!("Log in to {name} through Remote Desktop."),
             Kind::RustDesk => format!(
                 "The permanent password set in {name}'s RustDesk. Its \"Enable direct IP \
-                 access\" option must be on."
+                 access\" option must be on. RustDesk does not encrypt direct IP \
+                 connections: the screen and keys cross the network as they are, so use \
+                 it on your own network or through a VPN. The password itself is not sent."
             ),
         },
     };
@@ -186,7 +188,7 @@ pub async fn confirm_switch(window: &impl IsA<gtk::Widget>, name: &str, kind: Ki
         Kind::RustDesk => format!(
             "{name} does not answer over ssh, but it runs RustDesk with direct IP access. \
              gliff can show it and control it through RustDesk instead, with its \
-             permanent password."
+             permanent password. RustDesk does not encrypt direct IP connections."
         ),
     };
     let dialog = adw::AlertDialog::new(Some(&format!("Use {}?", kind.label())), Some(&body));
