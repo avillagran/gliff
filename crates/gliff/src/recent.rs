@@ -61,15 +61,41 @@ impl Config {
             std::fs::create_dir_all(dir)?;
         }
         let text = toml::to_string(self).map_err(std::io::Error::other)?;
-        // Written beside and renamed over, so the window and a control
-        // saving at once never leave, or read, half a file.
+        // Written beside under a name of its own and renamed over, so a
+        // reader never sees half a file.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut tmp = path.as_os_str().to_owned();
-        tmp.push(format!(".{}.tmp", std::process::id()));
+        tmp.push(format!(".{}.{n}.tmp", std::process::id()));
         let tmp = PathBuf::from(tmp);
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, path).inspect_err(|_| {
             let _ = std::fs::remove_file(&tmp);
         })
+    }
+
+    /// Load the config, `change` it and save it as one step. Other writers
+    /// in this process, and in other gliff processes, wait meanwhile, so
+    /// none loses what another changed. Returns what `change` returns.
+    pub fn update<R>(path: &Path, change: impl FnOnce(&mut Self) -> R) -> std::io::Result<R> {
+        static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _writing = WRITING.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let mut lock_path = path.as_os_str().to_owned();
+        lock_path.push(".lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(PathBuf::from(lock_path))?;
+        // Released when `lock` closes.
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)?;
+        let mut config = Self::load(path);
+        let result = change(&mut config);
+        config.save(path)?;
+        Ok(result)
     }
 
     fn parse(text: &str) -> Result<Self, toml::de::Error> {
@@ -286,6 +312,33 @@ mod tests {
     fn parse_reads_the_old_recent_machines_key() {
         let c = Config::parse("recent_machines = [\"a\", \"b\"]").unwrap();
         assert_eq!(c.machines, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn updates_from_many_threads_keep_every_change() {
+        let dir = std::env::temp_dir().join(format!("gliff-update-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        std::thread::scope(|scope| {
+            for i in 0..8 {
+                let path = &path;
+                scope.spawn(move || {
+                    Config::update(path, |c| {
+                        c.certificates.insert(format!("pc{i}"), format!("FP{i}"));
+                    })
+                    .unwrap();
+                });
+            }
+        });
+        let c = Config::load(&path);
+        assert_eq!(c.certificates.len(), 8);
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(left.iter().all(|n| !n.ends_with(".tmp")), "{left:?}");
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(dir.join("config.toml.lock"));
+        let _ = std::fs::remove_dir(&dir);
     }
 
     #[test]
