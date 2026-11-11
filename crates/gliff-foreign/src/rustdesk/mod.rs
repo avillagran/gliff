@@ -1,5 +1,5 @@
 //! RustDesk by direct IP: the other machine must have "Enable direct IP
-//! access" on, and a permanent password.
+//! access" on, and a permanent or one-time password.
 //!
 //! It opens by sending its identity with a key for this connection only;
 //! gliff seals a fresh secret to that key, and both ends encrypt with it
@@ -107,6 +107,21 @@ fn login_error(target: &Target, error: &str) -> Error {
     }
 }
 
+/// The session this machine knows gliff's logins to `target` by. It is the
+/// same for every connection, so a one-time password, which RustDesk
+/// replaces as soon as it lets a peer in, still lets in the view's and the
+/// control's next connections while the first is live: RustDesk takes them
+/// on the password it remembers for the session.
+fn session_id(target: &Target) -> u64 {
+    let digest = Sha256::new()
+        .chain_update(b"gliff session\0")
+        .chain_update(my_name().as_bytes())
+        .chain_update(b"\0")
+        .chain_update(target.address().as_bytes())
+        .finalize();
+    u64::from_le_bytes(digest[..8].try_into().expect("8 bytes"))
+}
+
 fn my_name() -> String {
     std::env::var("USER").unwrap_or_else(|_| "gliff".into())
 }
@@ -206,7 +221,7 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
             custom_fps: if control { CONTROL_FPS } else { 0 },
         }),
         video_ack_required: false,
-        session_id: OsRng.next_u64(),
+        session_id: session_id(target),
         version: CLIENT_VERSION.into(),
         my_platform: "Linux".into(),
     })))
