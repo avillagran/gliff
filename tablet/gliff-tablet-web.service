@@ -2,6 +2,7 @@
 Description=gliff: the page that shows the tablet screen, on port 6080
 
 [Service]
-ExecStart=%h/.local/share/gliff-tablet/venv/bin/python %h/.local/share/gliff-tablet/tablet-web.py
+Environment=GLIFF_CONFIG_DIR=@CONFIG@
+ExecStart=@DATA@/venv/bin/python @DATA@/tablet-web.py
 Restart=on-failure
 RestartSec=2

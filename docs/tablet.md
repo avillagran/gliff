@@ -13,7 +13,7 @@ bin/install-tablet
 sudo ufw allow from <tablet address> to any port 6080 proto tcp
 ```
 
-The installer puts the page and its bridge in `~/.local/share/gliff-tablet`
+The installer puts the page and its bridge in `~/.local/share/gliff-tablet` (under `XDG_DATA_HOME` when it is set)
 (noVNC 0.6.2, the last release that runs on iOS 8's Safari, checked against
 its checksum, and websockify in a virtualenv) and two user units:
 

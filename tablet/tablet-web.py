@@ -14,8 +14,12 @@ import time
 from websockify.websocketproxy import ProxyRequestHandler, WebSocketProxy
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PASSWORD_FILE = os.path.expanduser("~/.config/gliff/vnc-password")
-SETTINGS_FILE = os.path.expanduser("~/.config/gliff/tablet.env")
+# gliff's config directory, as the installer found it.
+CONFIG_DIR = os.environ.get("GLIFF_CONFIG_DIR") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "gliff"
+)
+PASSWORD_FILE = os.path.join(CONFIG_DIR, "vnc-password")
+SETTINGS_FILE = os.path.join(CONFIG_DIR, "tablet.env")
 UNIT = "gliff-tablet-vnc.service"
 # The newest viewer holds the screen. Each connection runs in a process of
 # its own, so the newest one is named in a file the others watch.
@@ -57,6 +61,39 @@ def state():
     return out or "unknown"
 
 
+class LoginWatch:
+    """The server's side of the page's RFB 3.8 login, read as it passes, to
+    tell when the page has logged in: its version, the security types
+    gliff-server offers (one), the challenge for a password, then the
+    result."""
+
+    def __init__(self):
+        self.data = b""
+        # None until the result is in, then whether the login succeeded.
+        self.done = None
+
+    def feed(self, chunk):
+        if self.done is not None:
+            return self.done
+        self.data += chunk
+        d = self.data
+        if len(d) < 13:
+            return None
+        n = d[12]
+        if n == 0:
+            self.done = False
+            return False
+        if len(d) < 13 + n:
+            return None
+        types = d[13 : 13 + n]
+        # VNC Authentication sends a 16-byte challenge before the result.
+        result_at = 13 + n + (16 if 2 in types and 1 not in types else 0)
+        if len(d) < result_at + 4:
+            return None
+        self.done = d[result_at : result_at + 4] == b"\0\0\0\0"
+        return self.done
+
+
 class Handler(ProxyRequestHandler):
     def new_websocket_client(self):
         # Pages from before this check retry forever; turn them away.
@@ -64,8 +101,10 @@ class Handler(ProxyRequestHandler):
             raise self.CClose(4003, "old page, reload it")
         self.viewer = "%d-%d" % (os.getpid(), time.monotonic_ns())
         self.stamp = settings_stamp()
-        with open(LATEST, "w", encoding="utf-8") as f:
-            f.write(self.viewer)
+        # Named the newest viewer only once it has logged in, so someone
+        # without the password cannot take the screen from the tablet.
+        self.published = False
+        self.login = LoginWatch()
         try:
             super().new_websocket_client()
         except self.CClose:
@@ -75,7 +114,21 @@ class Handler(ProxyRequestHandler):
                 raise self.CClose(4001, "replaced")
             raise
 
+    def send_frames(self, bufs=None):
+        # The server's bytes on their way to the page.
+        if not self.published and bufs:
+            for chunk in bufs:
+                if self.login.feed(chunk):
+                    with open(LATEST, "w", encoding="utf-8") as f:
+                        f.write(self.viewer)
+                    self.published = True
+                    break
+        return super().send_frames(bufs)
+
     def replaced(self):
+        # A viewer still logging in holds nothing to be replaced from.
+        if not getattr(self, "published", False):
+            return False
         try:
             with open(LATEST, encoding="utf-8") as f:
                 latest = f.read().strip()

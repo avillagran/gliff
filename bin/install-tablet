@@ -6,6 +6,9 @@ set -eu
 ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 DEST="${XDG_DATA_HOME:-$HOME/.local/share}/gliff-tablet"
 UNITS="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+# Where gliff's window keeps the password and tablet.env, which follows
+# XDG_CONFIG_HOME as the units here must too.
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/gliff"
 NOVNC_VERSION=0.6.2   # the last noVNC without ES modules: it runs on iOS 8
 NOVNC_SHA256=70a27fe472b901faef7235a61e01aed884ec8c2234a666844acfd9da7e5bcf9b
 WEBSOCKIFY_VERSION=0.13.0
@@ -46,8 +49,13 @@ fi
 "$DEST/venv/bin/python" -m pip install --quiet --disable-pip-version-check \
     "websockify==$WEBSOCKIFY_VERSION"
 
-sed "s|@SERVER@|$SERVER|" "$ROOT/tablet/gliff-tablet-vnc.service" > "$UNITS/gliff-tablet-vnc.service"
-install -m 644 "$ROOT/tablet/gliff-tablet-web.service" "$UNITS/gliff-tablet-web.service"
+# The units name the directories chosen here, so a custom XDG_DATA_HOME or
+# XDG_CONFIG_HOME works as the default does.
+fill() {
+    sed -e "s|@SERVER@|$SERVER|g" -e "s|@DATA@|$DEST|g" -e "s|@CONFIG@|$CONFIG|g" "$1"
+}
+fill "$ROOT/tablet/gliff-tablet-vnc.service" > "$UNITS/gliff-tablet-vnc.service"
+fill "$ROOT/tablet/gliff-tablet-web.service" > "$UNITS/gliff-tablet-web.service"
 systemctl --user daemon-reload
 echo "Installed. Open gliff and use the tablet button, or: systemctl --user start gliff-tablet-web gliff-tablet-vnc"
 echo "Let the tablet reach port 6080, for example: sudo ufw allow from <tablet address> to any port 6080 proto tcp"
