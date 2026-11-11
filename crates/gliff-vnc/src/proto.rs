@@ -31,13 +31,28 @@ impl Version {
     /// The version to speak with a client that sent `line`: the highest the
     /// server knows that is not above the client's.
     fn from_client(line: &[u8; 12]) -> Result<Self> {
-        let text = std::str::from_utf8(line).unwrap_or("");
-        let bad = || Error::Protocol(format!("not a VNC client: {:?}", text.trim_end()));
-        if !text.starts_with("RFB ") || &text[7..8] != "." || !text.ends_with('\n') {
+        // Read as bytes: a client's line is not trusted to be ASCII, and
+        // slicing text could split a character.
+        let bad = || {
+            Error::Protocol(format!(
+                "not a VNC client: {:?}",
+                String::from_utf8_lossy(line).trim_end()
+            ))
+        };
+        if &line[..4] != b"RFB " || line[7] != b'.' || line[11] != b'\n' {
             return Err(bad());
         }
-        let major: u32 = text[4..7].parse().map_err(|_| bad())?;
-        let minor: u32 = text[8..11].parse().map_err(|_| bad())?;
+        let number = |digits: &[u8]| -> Result<u32> {
+            if !digits.iter().all(u8::is_ascii_digit) {
+                return Err(bad());
+            }
+            std::str::from_utf8(digits)
+                .ok()
+                .and_then(|d| d.parse().ok())
+                .ok_or_else(bad)
+        };
+        let major = number(&line[4..7])?;
+        let minor = number(&line[8..11])?;
         Ok(match (major, minor) {
             (3, 0..=6) => Self::V3_3,
             (3, 7) => Self::V3_7,
