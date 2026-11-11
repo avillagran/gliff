@@ -16,6 +16,7 @@ members = [
     "crates/gliff-server",
     "crates/gliff-probe",
     "crates/gliff-vnc",
+    "crates/gliff-foreign",
 ]
 
 [workspace.package]
@@ -43,6 +44,7 @@ gliff-va = { path = "crates/gliff-va" }
 gliff-vk = { path = "crates/gliff-vk" }
 gliff-sw = { path = "crates/gliff-sw" }
 gliff-vnc = { path = "crates/gliff-vnc" }
+gliff-foreign = { path = "crates/gliff-foreign" }
 openh264 = { version = "0.9", features = ["source"] }
 openh264-sys2 = "0.9"
 
