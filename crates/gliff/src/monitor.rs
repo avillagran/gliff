@@ -410,12 +410,12 @@ impl Controller {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
-        let mut config = Config::load(&ui.config_path);
-        let Some(settings) = config.monitors.get_mut(name) else {
-            return;
-        };
-        settings.sound = on;
-        if let Err(e) = config.save(&ui.config_path) {
+        let saved = Config::update(&ui.config_path, |c| {
+            if let Some(settings) = c.monitors.get_mut(name) {
+                settings.sound = on;
+            }
+        });
+        if let Err(e) = saved {
             self.note(&format!("Cannot save the sound setting: {e}"));
         }
     }
@@ -575,9 +575,10 @@ impl Controller {
                 alignment: ALIGNMENTS[(align.selected() as usize).min(2)].0.into(),
                 sound: saved.sound,
             };
-            let mut config = Config::load(&ui.config_path);
-            config.monitors.insert(name.clone(), settings.clone());
-            if let Err(e) = config.save(&ui.config_path) {
+            let saved = Config::update(&ui.config_path, |c| {
+                c.monitors.insert(name.clone(), settings.clone());
+            });
+            if let Err(e) = saved {
                 c.note(&format!("Cannot save the screen settings: {e}"));
                 return;
             }

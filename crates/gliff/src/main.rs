@@ -1248,9 +1248,7 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
             ui.local_clipboard.borrow().as_ref(),
         );
         if s.endpoint.is_listed() {
-            let mut config = Config::load(&ui.config_path);
-            config.shown = Some(s.name.clone());
-            save_config(ui, &config);
+            update_config(ui, |c| c.shown = Some(s.name.clone()));
         }
     }
     ui.window.set_title(Some(&window_title(&s.endpoint)));
@@ -1304,9 +1302,7 @@ fn stop_session(ui: &Rc<App>, name: &str) {
     s.last_frame.borrow_mut().take();
     // A machine stopped by hand stays stopped when the window reopens.
     if s.endpoint.is_listed() {
-        let mut config = Config::load(&ui.config_path);
-        config.set_open(&s.name, false);
-        save_config(ui, &config);
+        update_config(ui, |c| c.set_open(&s.name, false));
     }
     let names = tab_names(ui);
     ui.sessions.borrow_mut().retain(|o| !Rc::ptr_eq(o, &s));
@@ -1327,29 +1323,28 @@ fn stop_session(ui: &Rc<App>, name: &str) {
 
 /// Drop a machine that is not running from the remembered list.
 fn forget_machine(ui: &Rc<App>, name: &str) {
-    let mut config = Config::load(&ui.config_path);
-    config.forget(name);
+    update_config(ui, |c| c.forget(name));
     if gliff_foreign::Target::parse(name).is_some() {
         foreign_ui::forget(name);
     }
-    save_config(ui, &config);
     refresh_tabs(ui);
 }
 
 /// Move the dragged tab next to the one it was dropped on. Only remembered
 /// machines have a place to keep.
 fn move_tab(ui: &Rc<App>, dragged: &str, target: &str, after: bool) {
-    let mut config = Config::load(&ui.config_path);
-    if config.move_machine(dragged, target, after) {
-        save_config(ui, &config);
+    if update_config(ui, |c| c.move_machine(dragged, target, after)) == Some(true) {
         refresh_tabs(ui);
     }
 }
 
-fn save_config(ui: &App, config: &Config) {
-    if let Err(e) = config.save(&ui.config_path) {
-        tracing::warn!(path = %ui.config_path.display(), error = %e, "cannot save config");
-    }
+/// Change the saved config with `change`; `None` when it cannot be saved.
+fn update_config<R>(ui: &App, change: impl FnOnce(&mut Config) -> R) -> Option<R> {
+    Config::update(&ui.config_path, change)
+        .inspect_err(|e| {
+            tracing::warn!(path = %ui.config_path.display(), error = %e, "cannot save config");
+        })
+        .ok()
 }
 
 /// Set a session's status, showing it when the session is. A streaming
@@ -1478,10 +1473,10 @@ fn remember_machine(ui: &Rc<App>, s: &Session) {
     if !s.endpoint.is_listed() || s.remembered.replace(true) {
         return;
     }
-    let mut config = Config::load(&ui.config_path);
-    config.remember(&s.name);
-    config.set_open(&s.name, true);
-    save_config(ui, &config);
+    update_config(ui, |c| {
+        c.remember(&s.name);
+        c.set_open(&s.name, true);
+    });
     refresh_tabs(ui);
 }
 
@@ -1597,9 +1592,7 @@ fn probe_foreign(ui: Rc<App>, s: Rc<Session>) {
             }
         };
         let new_name = target.to_string();
-        let mut config = Config::load(&ui.config_path);
-        config.rename(&s.name, &new_name);
-        save_config(&ui, &config);
+        update_config(&ui, |c| c.rename(&s.name, &new_name));
         stop_session(&ui, &s.name);
         match find_session(&ui, &new_name) {
             Some(open) => show_session(&ui, &open),
@@ -1947,9 +1940,7 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                 }
                 Status::NewCertificate(fingerprint) => {
                     tracing::info!(machine = %s.name, %fingerprint, "keeping the RDP certificate");
-                    let mut config = Config::load(&ui.config_path);
-                    config.certificates.insert(s.name.clone(), fingerprint);
-                    save_config(&ui, &config);
+                    update_config(&ui, |c| c.certificates.insert(s.name.clone(), fingerprint));
                 }
                 Status::Closed => {
                     show_disconnected(&ui, &s);
