@@ -9,15 +9,23 @@ use libadwaita as adw;
 
 use crate::secrets::{self, Saved};
 
+/// A login to use.
+pub struct Login {
+    pub credentials: Credentials,
+    /// Typed just now, with "Remember" on: keep it once the machine takes
+    /// it, so a mistyped password is never kept.
+    pub remember: bool,
+}
+
 /// The login for `name`: the one saved in the keyring, unless `refused`
-/// says it was just turned down; otherwise asked for, and saved when the
-/// user says so. `None` when the user cancelled.
+/// says it was just turned down; otherwise asked for. `None` when the user
+/// cancelled.
 pub async fn credentials(
     window: &impl IsA<gtk::Widget>,
     name: &str,
     target: &Target,
     refused: Option<&str>,
-) -> Option<Credentials> {
+) -> Option<Login> {
     let saved = {
         let name = name.to_string();
         gio::spawn_blocking(move || secrets::load(&name))
@@ -33,9 +41,12 @@ pub async fn credentials(
     };
     if refused.is_none() {
         if let Some(s) = &saved {
-            return Some(Credentials {
-                user: s.user.clone(),
-                password: s.password.clone(),
+            return Some(Login {
+                credentials: Credentials {
+                    user: s.user.clone(),
+                    password: s.password.clone(),
+                },
+                remember: false,
             });
         }
     }
@@ -46,20 +57,27 @@ pub async fn credentials(
         .or_else(|| target.user.clone())
         .unwrap_or_default();
     let (credentials, remember) = ask(window, name, target, &user, refused).await?;
-    if remember {
-        let name = name.to_string();
-        let saved = Saved {
-            user: credentials.user.clone(),
-            password: credentials.password.clone(),
-        };
-        let stored = gio::spawn_blocking(move || secrets::store(&name, &saved)).await;
-        match stored {
+    Some(Login {
+        credentials,
+        remember,
+    })
+}
+
+/// Keep `credentials` for `name` in the keyring, now that the machine took
+/// them.
+pub fn remember(name: &str, credentials: &Credentials) {
+    let name = name.to_string();
+    let saved = Saved {
+        user: credentials.user.clone(),
+        password: credentials.password.clone(),
+    };
+    glib::spawn_future_local(async move {
+        match gio::spawn_blocking(move || secrets::store(&name, &saved)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => tracing::warn!(error = %format!("{e:#}"), "cannot save the password"),
             Err(_) => tracing::warn!("cannot save the password"),
         }
-    }
-    Some(credentials)
+    });
 }
 
 /// Forget the password saved for `name`, as when the machine is forgotten.
