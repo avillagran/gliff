@@ -1634,6 +1634,9 @@ fn probe_foreign(ui: Rc<App>, s: Rc<Session>) {
                 },
             ),
         }
+        // Closing the only tab opened the address bar; the machine has one
+        // again.
+        show_address_bar(&ui, false);
     });
 }
 

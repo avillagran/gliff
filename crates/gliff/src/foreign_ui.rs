@@ -113,12 +113,10 @@ async fn ask(
     dialog.set_response_appearance("connect", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("connect"));
     dialog.set_close_response("cancel");
-    {
-        let dialog = dialog.clone();
-        password_row.connect_entry_activated(move |_| {
-            dialog.emit_by_name::<()>("response", &[&"connect"]);
-        });
-    }
+    // Enter in a field connects, as the default response, which also
+    // closes the dialog.
+    user_row.set_activates_default(true);
+    password_row.set_activates_default(true);
     if kind.takes_user() && user.is_empty() {
         user_row.grab_focus();
     } else {
