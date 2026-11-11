@@ -154,6 +154,16 @@ The clipboard is shared with each machine in both directions, and
 this one, not another driven machine, and stops being available here if its
 machine drops.
 
+**Machines that run RDP or RustDesk.** A Windows PC, or any machine with a
+Remote Desktop server or RustDesk instead of gliff, gets a tab like the
+others: type `rdp://user@host` or `rustdesk://host` in the address bar. Its
+tab shows its screen, and the mouse button drives it across the edge you
+pick for it, as with `--control`. gliff asks for the password once and keeps
+it in the desktop's keyring. A machine added as `user@host` that does not let
+ssh in is checked for both, and gliff offers to use what answers. See
+[docs/foreign.md](docs/foreign.md) for what each needs and what to know about
+their security.
+
 ## If something does not work
 
 - Run `gliff-probe all` on each machine. It checks the compositor, the GPU

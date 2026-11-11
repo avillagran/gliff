@@ -1556,6 +1556,14 @@ fn probe_foreign(ui: Rc<App>, s: Rc<Session>) {
     if s.probed.replace(true) || s.connected.get() {
         return;
     }
+    // One that worked over ssh before is only down for now.
+    if Config::load(&ui.config_path)
+        .machines
+        .iter()
+        .any(|m| *m == s.name)
+    {
+        return;
+    }
     let host = target.host.clone();
     glib::spawn_future_local(async move {
         let Some(kind) = foreign_ui::probe(&host).await else {
@@ -1878,9 +1886,11 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                 }
                 Status::Error(e) => {
                     tracing::error!(machine = %s.name, error = %e, "connection failed");
-                    let unreachable = foreign_ui::ssh_unreachable(&e) && !s.connected.get();
+                    // A machine that never connected may run RDP or
+                    // RustDesk instead; ssh's own reason does not reach here.
+                    let never_connected = !s.connected.get();
                     show_disconnected(&ui, &s);
-                    if unreachable {
+                    if never_connected {
                         probe_foreign(ui.clone(), s.clone());
                     }
                     schedule_reconnect(ui.clone(), s.clone(), generation, Some(&e));
