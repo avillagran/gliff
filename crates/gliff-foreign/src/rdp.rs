@@ -331,6 +331,7 @@ pub(crate) async fn run(
         scroll: Scroll::default(),
         view: matches!(purpose, Purpose::View { .. }),
         factory,
+        redraw: (result.refresh_rect_support, result.suppress_output_support),
     }
     .run(input, events)
     .await
@@ -344,6 +345,9 @@ struct Session<S> {
     scroll: Scroll,
     view: bool,
     factory: ConnectionActivationFactory,
+    /// How the server lets the client ask for the whole screen again:
+    /// Refresh Rect, Suppress Output.
+    redraw: (bool, bool),
 }
 
 impl<S> Session<S>
@@ -358,6 +362,9 @@ where
         let mut tick = tokio::time::interval(FRAME_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut dirty = false;
+        // Some servers draw only what changes (weston): ask for the whole
+        // screen, so the window does not stay black until something moves.
+        self.redraw().await?;
         loop {
             tokio::select! {
                 pdu = self.framed.read_pdu() => {
@@ -435,6 +442,22 @@ where
         Ok(true)
     }
 
+    /// Ask for the whole screen, where the server lets the client.
+    async fn redraw(&mut self) -> Result<(), Error> {
+        if !self.view {
+            return Ok(());
+        }
+        let (refresh, suppress) = self.redraw;
+        let frames = self
+            .stage
+            .request_full_redraw(self.image.width(), self.image.height(), refresh, suppress)
+            .map_err(|e| Error::other(format!("{e}")))?;
+        for frame in frames {
+            self.write(&frame).await?;
+        }
+        Ok(())
+    }
+
     async fn write(&mut self, frame: &[u8]) -> Result<(), Error> {
         self.framed
             .write_all(frame)
@@ -454,6 +477,8 @@ where
                 enable_server_pointer,
                 pointer_software_rendering,
                 static_channel_chunk_size,
+                refresh_rect_support,
+                suppress_output_support,
                 ..
             } = sequence.connection_activation_state()
             {
@@ -482,7 +507,8 @@ where
                         height: desktop_size.height.into(),
                     });
                 }
-                return Ok(());
+                self.redraw = (refresh_rect_support, suppress_output_support);
+                return self.redraw().await;
             }
             if sequence.state().is_terminal() {
                 return Err(Error::other(
