@@ -118,9 +118,7 @@ pub(crate) async fn run(
     input: &mut UnboundedReceiver<ClientMsg>,
     events: &mut dyn FnMut(Event),
 ) -> Result<(), Error> {
-    let io = TcpStream::connect(target.address())
-        .await
-        .map_err(|e| Error::other(format!("connect to {}: {e}", target.address())))?;
+    let io = crate::reach(target).await?;
     let _ = io.set_nodelay(true);
     // RustDesk takes a direct login only under the address it was reached
     // at.

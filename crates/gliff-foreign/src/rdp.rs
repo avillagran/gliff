@@ -200,9 +200,7 @@ async fn connect(
     config: &ironrdp_connector::Config,
     known_certificate: Option<&str>,
 ) -> Result<Connected, Error> {
-    let stream = TcpStream::connect(target.address())
-        .await
-        .map_err(|e| Error::other(format!("connect to {}: {e}", target.address())))?;
+    let stream = crate::reach(target).await?;
     let _ = stream.set_nodelay(true);
     let client_addr = stream
         .local_addr()

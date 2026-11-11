@@ -25,6 +25,10 @@ pub const RUSTDESK_PORT: u16 = 21118;
 
 /// How long [`probe`] waits for each port.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// How long a machine has to answer before a session gives up on it, so a
+/// firewall that drops packets fails the tab instead of leaving it
+/// connecting forever.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// What a foreign machine runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -359,6 +363,21 @@ impl Scroll {
         let whole = (*left / NOTCH).trunc();
         *left -= whole * NOTCH;
         whole as i32
+    }
+}
+
+/// A connection to `target`, or why there is none within
+/// [`CONNECT_TIMEOUT`].
+pub(crate) async fn reach(target: &Target) -> Result<TcpStream, Error> {
+    let address = target.address();
+    match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&address)).await {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err(Error::other(format!("connect to {address}: {e}"))),
+        Err(_) => Err(Error::other(format!(
+            "{address} did not answer within {}s; is the {} server running and the port open?",
+            CONNECT_TIMEOUT.as_secs(),
+            target.kind.label()
+        ))),
     }
 }
 
