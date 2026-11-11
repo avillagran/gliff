@@ -60,8 +60,12 @@ front of you.
 
 ## RustDesk
 
-The other machine needs RustDesk's "Enable direct IP access" option and a
-permanent password; gliff does not use RustDesk's rendezvous servers or IDs.
+The other machine needs RustDesk's "Enable direct IP access" option; gliff
+does not use RustDesk's rendezvous servers or IDs. Its permanent password or
+the one-time password it shows both work. RustDesk replaces a one-time
+password once it has let gliff in, so keeping one in the keyring only helps
+until then: next time gliff asks for the new one. With no password, the
+machine asks its user to accept the connection.
 Its picture comes as VP9 or VP8, decoded with the system's libvpx.
 
 The connection is encrypted with a key made for it, but without a

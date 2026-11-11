@@ -329,3 +329,9 @@ fn the_box_seals_as_libsodium_does() {
 fn hex(b: &[u8]) -> String {
     b.iter().map(|b| format!("{b:02x}")).collect()
 }
+
+#[test]
+fn every_login_to_a_machine_is_one_session() {
+    assert_eq!(session_id(&target(21118)), session_id(&target(21118)));
+    assert_ne!(session_id(&target(21118)), session_id(&target(21119)));
+}
