@@ -153,6 +153,18 @@ async fn garbage_is_not_a_client() {
 }
 
 #[tokio::test]
+async fn a_line_that_is_not_ascii_is_refused_not_a_panic() {
+    // "é" is two bytes: slicing the line as text would split it.
+    let err = run(Security::None, |mut c| async move {
+        expect(&mut c, b"RFB 003.008\n").await;
+        c.write_all("RFB 00é000\n".as_bytes()).await.unwrap();
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(err, Error::Protocol(_)));
+}
+
+#[tokio::test]
 async fn client_messages_parse() {
     let (mut a, mut b) = duplex(4096);
     let mut bytes = vec![0u8, 0, 0, 0];

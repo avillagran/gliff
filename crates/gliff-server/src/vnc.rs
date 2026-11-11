@@ -18,9 +18,9 @@ use gliff_vnc::screen::Screen;
 use hypr_capture::{CaptureConfig, CaptureEvent, CapturedFrame, Capturer};
 use hypr_input::{Axis, Input, InputCmd, InputConfig};
 use tokio::io::AsyncWriteExt;
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedSender};
+use tokio::sync::mpsc::{channel, unbounded_channel, Sender, UnboundedSender};
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::session::{self, ServedOutput, SessionOutput};
@@ -50,6 +50,15 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const WRONG_PASSWORD_DELAY: Duration = Duration::from_secs(2);
 /// Logins in progress at once.
 const MAX_HANDSHAKES: usize = 4;
+/// Updates waiting for a client to read them before it counts as stalled.
+const MAX_QUEUED_UPDATES: usize = 4;
+/// How long one write to a client may take before it counts as stalled.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Client messages read ahead of the server; past that, reading waits.
+const MAX_QUEUED_MESSAGES: usize = 256;
+
+/// A client's message, or why its connection ended, under its id.
+type Message = (u64, Result<ClientMsg, String>);
 
 /// RFB pointer button bits and the evdev buttons they press.
 const BUTTONS: [(u8, u32); 3] = [
@@ -115,7 +124,7 @@ pub async fn run(cfg: session::Config, vnc: Config) -> Result<()> {
         next_frame_at: Instant::now(),
     };
     let (logins, mut login_rx) = unbounded_channel();
-    let (messages, mut message_rx) = unbounded_channel();
+    let (messages, mut message_rx) = channel::<Message>(MAX_QUEUED_MESSAGES);
     let handshakes = std::rc::Rc::new(std::cell::Cell::new(0usize));
     let mut terminate = signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut hangup = signal(tokio::signal::unix::SignalKind::hangup())?;
@@ -131,13 +140,14 @@ pub async fn run(cfg: session::Config, vnc: Config) -> Result<()> {
                     tracing::warn!(%peer, "too many logins at once; refusing");
                     continue;
                 }
-                handshakes.set(handshakes.get() + 1);
-                let (security, logins, handshakes) = (security.clone(), logins.clone(), handshakes.clone());
+                let slot = LoginSlot::take(&handshakes);
+                let (security, logins) = (security.clone(), logins.clone());
                 let size = server.size();
                 let name = vnc.name.clone();
                 tokio::task::spawn_local(async move {
+                    // Given back however the login ends, a panic included.
+                    let _slot = slot;
                     login(stream, peer, security, size, name, logins).await;
-                    handshakes.set(handshakes.get() - 1);
                 });
             }
             Some((stream, hello, peer)) = login_rx.recv() => {
@@ -147,7 +157,7 @@ pub async fn run(cfg: session::Config, vnc: Config) -> Result<()> {
                 if server.client.as_ref().is_some_and(|c| c.id == id) {
                     match msg {
                         Ok(msg) => {
-                            if let Err(e) = server.on_message(msg).await {
+                            if let Err(e) = server.on_message(msg) {
                                 server.drop_client(&format!("{e:#}"));
                             }
                         }
@@ -162,7 +172,7 @@ pub async fn run(cfg: session::Config, vnc: Config) -> Result<()> {
                     if let Some(client) = &mut server.client {
                         client.fresh = true;
                     }
-                    if let Err(e) = server.send_update().await {
+                    if let Err(e) = server.send_update() {
                         server.drop_client(&format!("{e:#}"));
                     }
                 }
@@ -177,7 +187,7 @@ pub async fn run(cfg: session::Config, vnc: Config) -> Result<()> {
                 if let Some(client) = &mut server.client {
                     client.fresh = true;
                 }
-                if let Err(e) = server.send_update().await {
+                if let Err(e) = server.send_update() {
                     server.drop_client(&format!("{e:#}"));
                 }
             }
@@ -200,6 +210,22 @@ fn signal(kind: tokio::signal::unix::SignalKind) -> Result<tokio::signal::unix::
 }
 
 type Login = (TcpStream, Hello, SocketAddr);
+
+/// One of the MAX_HANDSHAKES logins in progress, given back when dropped.
+struct LoginSlot(std::rc::Rc<std::cell::Cell<usize>>);
+
+impl LoginSlot {
+    fn take(count: &std::rc::Rc<std::cell::Cell<usize>>) -> Self {
+        count.set(count.get() + 1);
+        Self(count.clone())
+    }
+}
+
+impl Drop for LoginSlot {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
+}
 
 /// Log a client in, and hand it to the server once its password checks out.
 async fn login(
@@ -278,7 +304,11 @@ fn start_capture(
 struct Client {
     id: u64,
     peer: SocketAddr,
-    writer: OwnedWriteHalf,
+    /// Bytes for the writer task, which sends them so a client that stops
+    /// reading never holds up the server.
+    out: Sender<Vec<u8>>,
+    /// The tasks reading and writing its connection, stopped with it.
+    tasks: [JoinHandle<()>; 2],
     encoder: Encoder,
     desktop_size: bool,
     /// The screen changed size since the client was last told.
@@ -292,7 +322,27 @@ struct Client {
     connected_at: Instant,
 }
 
+impl Drop for Client {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
 impl Client {
+    /// Queue `bytes` for the client; an error when it has stopped reading.
+    fn send(&self, bytes: Vec<u8>) -> Result<()> {
+        self.out.try_send(bytes).map_err(|e| match e {
+            tokio::sync::mpsc::error::TrySendError::Full(_) => {
+                anyhow::anyhow!("the client stopped reading its updates")
+            }
+            tokio::sync::mpsc::error::TrySendError::Closed(_) => {
+                anyhow::anyhow!("the connection to the client ended")
+            }
+        })
+    }
+
     /// Until when the first update waits for a fresh frame.
     fn stale_until(&self) -> Option<Instant> {
         (!self.fresh).then(|| self.connected_at + FIRST_FRAME_WAIT)
@@ -350,24 +400,38 @@ impl Server {
         stream: TcpStream,
         hello: Hello,
         peer: SocketAddr,
-        messages: &UnboundedSender<(u64, Result<ClientMsg, String>)>,
+        messages: &Sender<Message>,
     ) {
         if self.client.is_some() {
             self.drop_client("another client logged in");
         }
-        let (mut reader, writer) = stream.into_split();
+        let (mut reader, mut writer) = stream.into_split();
         self.next_id += 1;
         let id = self.next_id;
-        let messages = messages.clone();
-        tokio::task::spawn_local(async move {
+        let read_messages = messages.clone();
+        let read = tokio::task::spawn_local(async move {
             loop {
                 let msg = proto::read_msg(&mut reader)
                     .await
                     .map_err(|e| e.to_string());
                 let end = msg.is_err();
-                if messages.send((id, msg)).is_err() || end {
+                if read_messages.send((id, msg)).await.is_err() || end {
                     return;
                 }
+            }
+        });
+        let (out, mut queued) = channel::<Vec<u8>>(MAX_QUEUED_UPDATES);
+        let write_messages = messages.clone();
+        let write = tokio::task::spawn_local(async move {
+            while let Some(bytes) = queued.recv().await {
+                let why = match tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(&bytes)).await
+                {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(e)) => format!("write: {e}"),
+                    Err(_) => "the client stopped reading".to_string(),
+                };
+                let _ = write_messages.send((id, Err(why))).await;
+                return;
             }
         });
         if let Some(screen) = &mut self.screen {
@@ -383,7 +447,8 @@ impl Server {
         self.client = Some(Client {
             id,
             peer,
-            writer,
+            out,
+            tasks: [read, write],
             encoder: Encoder::new(Converter::new(PixelFormat::BGRX), Method::Raw),
             desktop_size: false,
             resized: false,
@@ -405,7 +470,7 @@ impl Server {
         let _ = self.input().send(InputCmd::ReleaseAll);
     }
 
-    async fn on_message(&mut self, msg: ClientMsg) -> Result<()> {
+    fn on_message(&mut self, msg: ClientMsg) -> Result<()> {
         let Some(client) = &mut self.client else {
             return Ok(());
         };
@@ -419,14 +484,15 @@ impl Server {
                 if let Some(map) = client.encoder.converter.colour_map() {
                     let mut out = Vec::new();
                     proto::colour_map(&map, &mut out);
-                    client.writer.write_all(&out).await?;
+                    client.send(out)?;
                 }
             }
             ClientMsg::SetEncodings(list) => {
                 let method = Method::choose(&list);
                 tracing::info!(?method, encodings = ?list, "client encodings");
-                let format = client.encoder.converter.clone();
-                client.encoder = Encoder::new(format, method);
+                // ZRLE runs one zlib stream for the whole connection, so
+                // the encoder, and its stream, stay.
+                client.encoder.method = method;
                 client.desktop_size = list.contains(&number::DESKTOP_SIZE);
             }
             ClientMsg::UpdateRequest { incremental, area } => {
@@ -436,7 +502,7 @@ impl Server {
                     }
                 }
                 client.pending = Some(area);
-                self.send_update().await?;
+                self.send_update()?;
             }
             ClientMsg::Key { down, keysym } => {
                 if let Some(stroke) = self.keys.event(keysym, down) {
@@ -510,9 +576,14 @@ impl Server {
         if resized {
             let first = self.screen.is_none();
             self.screen = Some(Screen::new(image.width, image.height));
-            self.served.width = image.width as u32;
-            self.served.height = image.height as u32;
-            let _ = self.input().send(self.served.logical_extent());
+            // A headless screen keeps the mode it was made with, for
+            // restore_mode to put back after a reload changed it; only an
+            // existing screen follows what it shows.
+            if !self.served.is_headless() {
+                self.served.width = image.width as u32;
+                self.served.height = image.height as u32;
+                let _ = self.input().send(self.served.logical_extent());
+            }
             if !first {
                 if let Some(client) = &mut self.client {
                     if client.desktop_size {
@@ -542,7 +613,7 @@ impl Server {
     }
 
     /// Answer the client's pending request if anything in it changed.
-    async fn send_update(&mut self) -> Result<()> {
+    fn send_update(&mut self) -> Result<()> {
         let (Some(client), Some(screen)) = (&mut self.client, &mut self.screen) else {
             return Ok(());
         };
@@ -574,14 +645,36 @@ impl Server {
             client.encoder.rect(&image, rect, &mut out);
         }
         client.pending = None;
-        let encoded = started.elapsed();
-        client.writer.write_all(&out).await?;
+        let (bytes, encoded) = (out.len(), started.elapsed());
+        client.send(out)?;
         tracing::debug!(
-            bytes = out.len(),
+            bytes,
             encode_ms = encoded.as_secs_f64() * 1000.0,
-            send_ms = (started.elapsed() - encoded).as_secs_f64() * 1000.0,
-            "update sent"
+            "update queued"
         );
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_login_slot_is_given_back_however_the_login_ends() {
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        {
+            let _a = LoginSlot::take(&count);
+            let _b = LoginSlot::take(&count);
+            assert_eq!(count.get(), 2);
+        }
+        assert_eq!(count.get(), 0);
+        let c = count.clone();
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _slot = LoginSlot::take(&c);
+            panic!("a login that panics");
+        }));
+        assert!(panicked.is_err());
+        assert_eq!(count.get(), 0);
     }
 }

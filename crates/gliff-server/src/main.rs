@@ -40,7 +40,7 @@ struct Cli {
     #[arg(long, requires = "vnc", requires = "headless", default_value = "1024x768", value_parser = parse_size)]
     size: (u32, u32),
     /// The VNC screen's scale: 2 for a high-density display.
-    #[arg(long, requires = "vnc", requires = "headless", default_value_t = 1.0)]
+    #[arg(long, requires = "vnc", requires = "headless", default_value_t = 1.0, value_parser = parse_scale)]
     scale: f32,
     /// A file whose first line is the VNC password. VNC Authentication uses
     /// its first 8 characters. `GLIFF_VNC_PASSWORD` works too.
@@ -219,6 +219,14 @@ where
 }
 
 /// `WIDTHxHEIGHT`, each between 64 and 4096 pixels.
+/// A scale from 0.5 to 4, as a client's resize takes.
+fn parse_scale(text: &str) -> Result<f32, String> {
+    match text.parse::<f32>() {
+        Ok(s) if s.is_finite() && (0.5..=4.0).contains(&s) => Ok(s),
+        _ => Err(format!("{text:?} is not a scale from 0.5 to 4")),
+    }
+}
+
 fn parse_size(text: &str) -> Result<(u32, u32), String> {
     let (w, h) = text
         .split_once(['x', 'X'])
@@ -295,6 +303,14 @@ fn validate_listen_addresses(addresses: &[std::net::SocketAddr], allow_remote: b
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn scales_must_be_finite_and_in_range() {
+        assert_eq!(parse_scale("2"), Ok(2.0));
+        for bad in ["0", "-1", "NaN", "inf", "8", "x"] {
+            assert!(parse_scale(bad).is_err(), "{bad}");
+        }
+    }
+
     #[test]
     fn development_listener_requires_loopback_or_explicit_opt_in() {
         for addr in ["0.0.0.0:9000", "[::]:9000", "192.168.1.2:9000"] {
