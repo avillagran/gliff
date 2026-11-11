@@ -551,6 +551,7 @@ where
     }
 
     fn translate(&mut self, msg: ClientMsg) -> Vec<FastPathInputEvent> {
+        tracing::trace!(?msg, "input for the RDP server");
         let ops: Vec<Operation> = match msg {
             ClientMsg::Key { keycode, pressed } => match keys::scancode(keycode) {
                 Some(code) => {
