@@ -48,11 +48,13 @@ fn versions_are_read_and_agreed() {
 #[test]
 fn vencrypt_takes_a_certificate_first_and_never_cleartext() {
     assert_eq!(
-        pick_vencrypt(&[257, 258, 262, 2]),
+        pick_vencrypt(&[257, 258, 262, 2], false),
         Some(VENCRYPT_X509_PLAIN)
     );
-    assert_eq!(pick_vencrypt(&[257, 2]), Some(VENCRYPT_VNC));
-    assert_eq!(pick_vencrypt(&[256, 257, 259]), None);
+    assert_eq!(pick_vencrypt(&[257, 2], false), Some(VENCRYPT_VNC));
+    assert_eq!(pick_vencrypt(&[2, 1, 262], true), Some(VENCRYPT_X509_PLAIN));
+    assert_eq!(pick_vencrypt(&[2, 1], true), None);
+    assert_eq!(pick_vencrypt(&[256, 257, 259], false), None);
 }
 
 /// The server's side of a 3.8 login with the VNC password `password`,
@@ -292,4 +294,46 @@ fn input_becomes_rfb_events() {
         ),
         [vec![255, 0, 0, 0, 0, 0, 0xff, 0x52, 0, 0, 0, 0xc8]]
     );
+}
+
+#[test]
+fn a_key_goes_up_as_the_keysym_it_went_down_as() {
+    let mut i = Input::default();
+    let size = (100, 50);
+    let key =
+        |i: &mut Input, keycode, pressed| i.translate(ClientMsg::Key { keycode, pressed }, size);
+    key(&mut i, 42, true);
+    assert_eq!(key(&mut i, 30, true), [vec![4, 1, 0, 0, 0, 0, 0, b'A']]);
+    key(&mut i, 42, false);
+    // Shift is up now, but A goes up as it went down.
+    assert_eq!(key(&mut i, 30, false), [vec![4, 0, 0, 0, 0, 0, 0, b'A']]);
+}
+
+#[tokio::test]
+async fn a_saved_certificate_is_not_given_up_for_a_login_without_it() {
+    let (client, mut server) = tokio::io::duplex(1 << 16);
+    let serve = tokio::spawn(async move {
+        server.write_all(b"RFB 003.008\n").await.unwrap();
+        let mut v = [0u8; 12];
+        server.read_exact(&mut v).await.unwrap();
+        // Only a password, no TLS, from a machine whose certificate is saved.
+        server.write_all(&[1, SECURITY_VNC]).await.unwrap();
+        let mut rest = Vec::new();
+        let _ = server.read_to_end(&mut rest).await;
+        rest
+    });
+    let result = handshake(
+        Box::new(client),
+        &target(),
+        &credentials("secret"),
+        Some("AA:BB"),
+    )
+    .await;
+    let sent = serve.await.unwrap();
+    assert!(sent.is_empty(), "the client chose a login: {sent:?}");
+    let why = result
+        .err()
+        .expect("logged in without the certificate")
+        .to_string();
+    assert!(why.contains("posing"), "{why}");
 }

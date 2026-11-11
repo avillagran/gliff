@@ -135,7 +135,7 @@ async fn vnc_auth(s: &mut Boxed, target: &Target, credentials: &Credentials) -> 
 /// The VeNCrypt kind to use of those `offered`, best first: under TLS with
 /// a certificate, then plain VNC password or none. Anonymous TLS and
 /// cleartext passwords are left out.
-fn pick_vencrypt(offered: &[u32]) -> Option<u32> {
+fn pick_vencrypt(offered: &[u32], tls_only: bool) -> Option<u32> {
     [
         VENCRYPT_X509_PLAIN,
         VENCRYPT_X509_VNC,
@@ -144,6 +144,7 @@ fn pick_vencrypt(offered: &[u32]) -> Option<u32> {
         VENCRYPT_NONE,
     ]
     .into_iter()
+    .filter(|k| !tls_only || *k >= VENCRYPT_X509_NONE)
     .find(|k| offered.contains(k))
 }
 
@@ -177,7 +178,8 @@ async fn vencrypt(
         offered.push(s.read_u32().await.map_err(&io)?);
     }
     tracing::debug!(host = %target.host, ?offered, "VeNCrypt kinds");
-    let Some(kind) = pick_vencrypt(&offered) else {
+    // With a saved certificate, only TLS that shows it will do.
+    let Some(kind) = pick_vencrypt(&offered, known_certificate.is_some()) else {
         return Err(Error::other(format!(
             "{} offers only VeNCrypt logins gliff does not make ({offered:?}): anonymous \
              TLS or a cleartext password. Give its VNC server a certificate.",
@@ -260,15 +262,30 @@ async fn handshake(
         s.read_exact(&mut offered).await.map_err(&io)?;
         offered
     };
-    let chosen = [SECURITY_NONE, SECURITY_VENCRYPT, SECURITY_VNC]
-        .into_iter()
+    // A machine whose certificate is saved logs in under that certificate
+    // or not at all: one that offers a login without it may be another
+    // machine posing as it. Otherwise TLS comes first where offered.
+    let allowed: &[u8] = if known_certificate.is_some() {
+        &[SECURITY_VENCRYPT]
+    } else {
+        &[SECURITY_VENCRYPT, SECURITY_NONE, SECURITY_VNC]
+    };
+    let chosen = allowed
+        .iter()
+        .copied()
         .find(|t| offered.contains(t))
-        .ok_or_else(|| {
-            Error::other(format!(
+        .ok_or_else(|| match known_certificate {
+            Some(_) => Error::other(format!(
+                "{} showed a certificate before, but now offers only logins without \
+                 it ({offered:?}); someone may be posing as it. If its VNC server was \
+                 set up again, forget it in gliff and connect again.",
+                target.host
+            )),
+            None => Error::other(format!(
                 "{} offers only VNC logins gliff does not make ({offered:?}); a VNC \
                  password or VeNCrypt with a certificate works",
                 target.host
-            ))
+            )),
         })?;
     tracing::debug!(host = %target.host, ?offered, chosen, minor, "VNC security");
     if minor != 3 {
@@ -552,6 +569,9 @@ struct Input {
     shift: [bool; 2],
     caps: bool,
     scroll: Scroll,
+    /// The keysym each held key went down as, for its release: Shift may
+    /// have changed in between.
+    held: std::collections::HashMap<u32, u32>,
 }
 
 fn pointer_event(buttons: u8, (x, y): (u16, u16)) -> Vec<u8> {
@@ -632,7 +652,17 @@ impl Input {
                     54 => self.shift[1] = pressed,
                     _ => {}
                 }
-                let sym = keysym::keysym(keycode, self.shift.contains(&true), self.caps);
+                let sym = if pressed {
+                    let sym = keysym::keysym(keycode, self.shift.contains(&true), self.caps);
+                    if let Some(sym) = sym {
+                        self.held.insert(keycode, sym);
+                    }
+                    sym
+                } else {
+                    self.held
+                        .remove(&keycode)
+                        .or_else(|| keysym::keysym(keycode, self.shift.contains(&true), self.caps))
+                };
                 let qemu = self.qemu_keys.then(|| qemu_keycode(keycode)).flatten();
                 match (qemu, sym) {
                     (Some(code), sym) => {

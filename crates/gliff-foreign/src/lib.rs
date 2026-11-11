@@ -127,6 +127,7 @@ impl Target {
             host,
             port: match port {
                 Some(display) if kind == Kind::Vnc && display < 100 => VNC_PORT + display,
+                Some(0) => return Err(format!("{hostport:?} names port 0")),
                 Some(port) => port,
                 None => kind.default_port(),
             },
@@ -190,9 +191,9 @@ impl fmt::Display for Target {
 /// `host`, `host:port`, `[v6]` or `[v6]:port`.
 fn split_port(text: &str) -> Result<(Option<String>, Option<u16>), String> {
     let port = |p: &str| {
+        // Zero is checked by the caller: VNC's display 0 is port 5900.
         p.parse::<u16>()
             .ok()
-            .filter(|p| *p != 0)
             .ok_or_else(|| format!("{p:?} is not a port"))
     };
     if let Some(rest) = text.strip_prefix('[') {
@@ -523,6 +524,8 @@ mod tests {
         let t = Target::parse("vnc://ann@mac.local:1").unwrap().unwrap();
         assert_eq!((t.kind, t.port), (Kind::Vnc, 5901));
         assert_eq!(t.user.as_deref(), Some("ann"));
+        let t = Target::parse("vnc://pc:0").unwrap().unwrap();
+        assert_eq!(t.port, 5900);
         let t = Target::parse("vnc://pc:5902").unwrap().unwrap();
         assert_eq!(t.port, 5902);
         assert_eq!(
