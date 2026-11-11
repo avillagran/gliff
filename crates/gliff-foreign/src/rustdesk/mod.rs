@@ -90,6 +90,16 @@ fn password_proof(password: &str, salt: &str, challenge: &str) -> Vec<u8> {
         .to_vec()
 }
 
+/// A machine that offers no key would take the password proof, the screen
+/// and the keys over plain TCP: gliff does not log in to it.
+fn unencrypted(target: &Target) -> Error {
+    Error::other(format!(
+        "{} offers no encryption key, so gliff does not log in to it: the login and \
+         everything after would cross the network unencrypted",
+        target.host
+    ))
+}
+
 fn login_error(target: &Target, error: &str) -> Error {
     match error {
         "Wrong Password" | "Empty Password" => {
@@ -142,12 +152,10 @@ pub(crate) async fn run(
         .map(|a| a.ip().to_string())
         .unwrap_or_else(|_| target.host.clone());
     let mut s = Stream::new(io);
-    let peer = tokio::time::timeout(
-        LOGIN_TIMEOUT,
-        login(&mut s, target, credentials, purpose, username),
-    )
-    .await
-    .map_err(|_| Error::other(format!("{} did not finish the login", target.host)))??;
+    let login = login(&mut s, target, credentials, purpose, username);
+    let Some(peer) = crate::set_up(target, LOGIN_TIMEOUT, input, login).await? else {
+        return Ok(());
+    };
     Session::new(s, peer, purpose)?.run(input, events).await
 }
 
@@ -172,10 +180,7 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
                     .await?;
                     s.cipher = Some(Cipher::new(&secret));
                 }
-                None => {
-                    tracing::warn!(host = %target.host, "RustDesk offered no key; unencrypted");
-                    s.send(&Message::default()).await?;
-                }
+                None => return Err(unencrypted(target)),
             }
             loop {
                 match s.recv().await?.union {
@@ -189,7 +194,7 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
                 }
             }
         }
-        Some(Union::Hash(h)) => h,
+        Some(Union::Hash(_)) => return Err(unencrypted(target)),
         _ => {
             return Err(Error::other(format!(
                 "{} does not speak RustDesk",

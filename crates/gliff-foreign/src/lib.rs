@@ -381,6 +381,38 @@ pub(crate) async fn reach(target: &Target) -> Result<TcpStream, Error> {
     }
 }
 
+/// `setup`, a connection's login, given up after `limit`, or dropped when
+/// `input` closes because the tab or the control stopped: `Ok(None)` then.
+/// Input sent meanwhile stays queued for the session.
+pub(crate) async fn set_up<T>(
+    target: &Target,
+    limit: Duration,
+    input: &UnboundedReceiver<ClientMsg>,
+    setup: impl std::future::Future<Output = Result<T, Error>>,
+) -> Result<Option<T>, Error> {
+    tokio::pin!(setup);
+    let deadline = tokio::time::sleep(limit);
+    tokio::pin!(deadline);
+    let mut check = tokio::time::interval(Duration::from_millis(200));
+    loop {
+        tokio::select! {
+            done = &mut setup => return done.map(Some),
+            () = &mut deadline => {
+                return Err(Error::other(format!(
+                    "{} did not finish the login within {} s",
+                    target.host,
+                    limit.as_secs()
+                )));
+            }
+            _ = check.tick() => {
+                if input.is_closed() {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+}
+
 async fn probe_one(host: &str, kind: Kind) -> Option<Kind> {
     let target = Target {
         kind,
@@ -403,6 +435,32 @@ async fn probe_one(host: &str, kind: Kind) -> Option<Kind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_login_stops_with_its_tab_or_its_deadline() {
+        let target = Target::parse("rdp://pc").unwrap().unwrap();
+        let stalled = std::future::pending::<Result<(), Error>>;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(ClientMsg::PointerMotion { x: 1.0, y: 1.0 })
+            .unwrap();
+        drop(tx);
+        let r = set_up(&target, Duration::from_secs(60), &rx, stalled()).await;
+        assert!(matches!(r, Ok(None)));
+
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let r = set_up(&target, Duration::from_millis(50), &rx, stalled()).await;
+        assert!(r
+            .unwrap_err()
+            .to_string()
+            .contains("did not finish the login"));
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(ClientMsg::PointerMotion { x: 1.0, y: 1.0 })
+            .unwrap();
+        let r = set_up(&target, Duration::from_secs(60), &rx, async { Ok(7) }).await;
+        assert_eq!(r.unwrap(), Some(7));
+        assert!(rx.try_recv().is_ok(), "input sent meanwhile stays queued");
+    }
 
     #[test]
     fn parses_foreign_addresses() {

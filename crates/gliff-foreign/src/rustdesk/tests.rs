@@ -244,6 +244,42 @@ async fn a_wrong_password_asks_again() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn a_server_without_encryption_gets_no_login() -> anyhow::Result<()> {
+    // An identity with no key, then one that opens with the challenge.
+    for first in [
+        Union::SignedId(proto::SignedId { id: vec![0; 64] }),
+        Union::Hash(proto::Hash {
+            salt: "salt".into(),
+            challenge: "challenge".into(),
+        }),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        let server = tokio::spawn(async move {
+            let (io, _) = listener.accept().await?;
+            let mut s = Stream::new(io);
+            s.send(&msg(first)).await?;
+            // The client hangs up instead of answering.
+            anyhow::ensure!(s.recv().await.is_err(), "the client sent something");
+            anyhow::Ok(())
+        });
+        let (_tx, mut rx) = unbounded_channel();
+        let result = run(
+            &target(port),
+            &credentials(PASSWORD),
+            Purpose::Control,
+            &mut rx,
+            &mut |_| {},
+        )
+        .await;
+        server.await??;
+        let why = result.expect_err("logged in unencrypted").to_string();
+        assert!(why.contains("no encryption key"), "{why}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_rustdesk_server_answers_the_probe() -> anyhow::Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;

@@ -74,6 +74,15 @@ check, so a machine in the middle of the network could pose as it. The
 password itself never travels: only a hash, salted by the machine's own
 challenge.
 
+That encryption is also weaker than it looks. RustDesk's protocol uses one
+key in both directions, each side counting its messages from one, so a
+message each way shares a nonce; someone who records the connection can
+learn parts of one message from the other where either is predictable,
+such as the login or typed keys. gliff speaks the protocol as RustDesk does
+and cannot change that alone. A machine that offers no key at all is
+refused rather than logged in to without encryption. On a network you do
+not trust, reach a RustDesk machine through a VPN or an ssh tunnel.
+
 On Wayland, the RustDesk machine asks its user to pick the screen to share
 at each connection; gliff waits up to two minutes for that, or for the user
 to accept the connection when RustDesk is set to ask.

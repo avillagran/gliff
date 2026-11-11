@@ -37,6 +37,8 @@ use crate::{keys, Credentials, Cursor, Error, Event, Purpose, Scroll, Target};
 
 /// How often a changed screen is sent on, at most.
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+/// How long a server that answered has to finish TLS and the login.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 /// The screen asked for when driving from the edge: the server decides.
 const CONTROL_SIZE: DesktopSize = DesktopSize {
     width: 1920,
@@ -281,23 +283,29 @@ pub(crate) async fn run(
         Purpose::Control => CONTROL_SIZE,
     };
     let mut config = config(credentials, size);
-    let (framed, result, seen) = match connect(target, &config, known_certificate).await {
-        // Some servers offer NLA without a way to log in through it, and
-        // take the login over TLS alone (weston); one that requires NLA,
-        // as Windows does by default, refuses this second try, and the
-        // first refusal stands.
-        Err(Error::Auth(why)) => {
-            tracing::info!(host = %target.host, "NLA refused the login; trying TLS alone");
-            config.enable_credssp = false;
-            match connect(target, &config, known_certificate).await {
-                Ok(connected) => connected,
-                Err(e) => {
-                    tracing::debug!(error = %e, "TLS alone failed too");
-                    return Err(Error::Auth(why));
+    let setup = async {
+        match connect(target, &config, known_certificate).await {
+            // Some servers offer NLA without a way to log in through it,
+            // and take the login over TLS alone (weston); one that requires
+            // NLA, as Windows does by default, refuses this second try, and
+            // the first refusal stands.
+            Err(Error::Auth(why)) => {
+                tracing::info!(host = %target.host, "NLA refused the login; trying TLS alone");
+                config.enable_credssp = false;
+                match connect(target, &config, known_certificate).await {
+                    Ok(connected) => Ok(connected),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "TLS alone failed too");
+                        Err(Error::Auth(why))
+                    }
                 }
             }
+            connected => connected,
         }
-        connected => connected?,
+    };
+    let Some((framed, result, seen)) = crate::set_up(target, SETUP_TIMEOUT, input, setup).await?
+    else {
+        return Ok(());
     };
     if let (Some(seen), None) = (seen, known_certificate) {
         events(Event::NewCertificate(seen));
