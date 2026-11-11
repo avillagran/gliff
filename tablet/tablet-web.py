@@ -109,8 +109,10 @@ class Handler(ProxyRequestHandler):
             super().new_websocket_client()
         except self.CClose:
             # gliff-server drops the older viewer as soon as the newer one
-            # logs in, often before the check below runs: say why.
-            if self.replaced():
+            # logs in, which can be before the newer bridge has read the
+            # login reply and named itself: wait a moment for that name
+            # before saying the close was anything else.
+            if self.replaced_soon():
                 raise self.CClose(4001, "replaced")
             raise
 
@@ -124,6 +126,16 @@ class Handler(ProxyRequestHandler):
                     self.published = True
                     break
         return super().send_frames(bufs)
+
+    def replaced_soon(self, wait=1.0):
+        """Whether a newer viewer names itself within `wait` seconds."""
+        deadline = time.monotonic() + wait
+        while True:
+            if self.replaced():
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.05)
 
     def replaced(self):
         # A viewer still logging in holds nothing to be replaced from.
