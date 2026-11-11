@@ -15,6 +15,7 @@ members = [
     "crates/gliff",
     "crates/gliff-server",
     "crates/gliff-probe",
+    "crates/gliff-foreign",
 ]
 
 [workspace.package]
@@ -41,6 +42,7 @@ hypr-edge = { path = "crates/hypr-edge" }
 gliff-va = { path = "crates/gliff-va" }
 gliff-vk = { path = "crates/gliff-vk" }
 gliff-sw = { path = "crates/gliff-sw" }
+gliff-foreign = { path = "crates/gliff-foreign" }
 openh264 = { version = "0.9", features = ["source"] }
 openh264-sys2 = "0.9"
 
