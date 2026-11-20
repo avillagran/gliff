@@ -724,7 +724,7 @@ impl Controller {
         if self.closing.get() || self.running.borrow().is_some() {
             return;
         }
-        if ui.screen_in_use.get() {
+        if ui.windows.screen_in_use.get() {
             self.note("Stop using the screen in the other Gliff window first.");
             return;
         }
@@ -756,10 +756,10 @@ impl Controller {
             output: detached.as_ref().map(|_| settings.output.clone()),
         };
         let weak = Rc::downgrade(self);
-        let screen_in_use = ui.screen_in_use.clone();
+        let windows = ui.windows.clone();
         let ended_name = name.clone();
         let started = Display::start(&target, &settings.side, &settings.alignment, move |why| {
-            screen_in_use.set(false);
+            windows.screen_in_use.set(false);
             let Some(c) = weak.upgrade() else {
                 return;
             };
@@ -785,7 +785,7 @@ impl Controller {
         });
         match started {
             Ok(display) => {
-                ui.screen_in_use.set(true);
+                ui.windows.screen_in_use.set(true);
                 if let Some(session) = detached {
                     self.choose(&name);
                     crate::pause_detached_view(&ui, &session);

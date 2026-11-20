@@ -246,9 +246,24 @@ pub struct RemoteDisplay {
     pub height: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RustDeskCommand {
+    Display(i32),
+    Audio(bool),
+}
+
+#[derive(Debug)]
+pub enum RustDeskAudio {
+    Permission(bool),
+    Format { sample_rate: u32, channels: u32 },
+    Packet(Vec<u8>),
+    Stop,
+}
+
 /// What a running session reports.
 #[derive(Debug)]
 pub enum Event {
+    RustDeskAudio(RustDeskAudio),
     RustDeskDisplays {
         displays: Vec<RemoteDisplay>,
         active: i32,
@@ -332,16 +347,16 @@ pub async fn run(
     }
 }
 
-/// View a RustDesk session with an optional in-session monitor change.
+/// View a RustDesk session with live monitor and audio controls.
 pub async fn view_rustdesk(
     target: &Target,
     credentials: &Credentials,
     purpose: Purpose,
     input: &mut UnboundedReceiver<ClientMsg>,
-    displays: &mut UnboundedReceiver<i32>,
+    commands: &mut UnboundedReceiver<RustDeskCommand>,
     events: &mut dyn FnMut(Event),
 ) -> Result<(), Error> {
-    rustdesk::run(target, credentials, purpose, input, Some(displays), events).await
+    rustdesk::run(target, credentials, purpose, input, Some(commands), events).await
 }
 
 /// What answers on `host`'s RDP and RustDesk ports, RDP first. Each answer

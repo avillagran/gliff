@@ -22,7 +22,10 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::{keys, Credentials, Error, Event, Purpose, RemoteDisplay, Scroll, Target};
+use crate::{
+    keys, Credentials, Error, Event, Purpose, RemoteDisplay, RustDeskAudio, RustDeskCommand,
+    Scroll, Target,
+};
 
 pub mod proto;
 pub mod stream;
@@ -133,7 +136,7 @@ pub(crate) async fn run(
     credentials: &Credentials,
     purpose: Purpose,
     input: &mut UnboundedReceiver<ClientMsg>,
-    displays: Option<&mut UnboundedReceiver<i32>>,
+    commands: Option<&mut UnboundedReceiver<RustDeskCommand>>,
     events: &mut dyn FnMut(Event),
 ) -> Result<(), Error> {
     let io = crate::reach(target).await?;
@@ -146,11 +149,12 @@ pub(crate) async fn run(
         .unwrap_or_else(|_| target.host.clone());
     let mut s = Stream::new(io);
     let login = login(&mut s, target, credentials, purpose, username);
-    let Some(peer) = crate::set_up(target, LOGIN_TIMEOUT, input, login).await? else {
+    let Some((peer, audio_allowed)) = crate::set_up(target, LOGIN_TIMEOUT, input, login).await?
+    else {
         return Ok(());
     };
-    Session::new(s, peer, purpose)?
-        .run(input, displays, events)
+    Session::new(s, peer, purpose, audio_allowed)?
+        .run(input, commands, events)
         .await
 }
 
@@ -160,7 +164,7 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
     credentials: &Credentials,
     purpose: Purpose,
     username: String,
-) -> Result<proto::PeerInfo, Error> {
+) -> Result<(proto::PeerInfo, bool), Error> {
     let first = s.recv().await?;
     let hash = match first.union {
         Some(Union::SignedId(id)) => {
@@ -233,18 +237,24 @@ async fn login<S: AsyncRead + AsyncWrite + Unpin>(
         my_platform: "Linux".into(),
     })))
     .await?;
+    let mut audio_allowed = true;
     loop {
         let m = s.recv().await?;
         tracing::debug!(message = ?m.union.as_ref().map(std::mem::discriminant), "while logging in");
         match m.union {
             Some(Union::LoginResponse(r)) => match r.union {
-                Some(proto::login_response::Union::PeerInfo(p)) => return Ok(p),
+                Some(proto::login_response::Union::PeerInfo(p)) => return Ok((p, audio_allowed)),
                 Some(proto::login_response::Union::Error(e)) => {
                     return Err(login_error(target, &e))
                 }
                 None => {}
             },
             Some(Union::Auth2Fa(_)) => return Err(login_error(target, "2FA Required")),
+            Some(Union::Misc(proto::Misc {
+                union: Some(proto::misc::Union::PermissionInfo(permission)),
+            })) if permission.permission == proto::AUDIO_PERMISSION => {
+                audio_allowed = permission.enabled;
+            }
             Some(Union::TestDelay(t)) if !t.from_client => {
                 s.send(&msg(Union::TestDelay(t))).await?;
             }
@@ -350,6 +360,9 @@ struct Session<S> {
     displays: Vec<proto::DisplayInfo>,
     pending_display: Option<(Screen, tokio::time::Instant)>,
     view: bool,
+    audio_allowed: bool,
+    audio_enabled: bool,
+    audio_configured: bool,
     decoder: Option<vpx::Decoder>,
     scroll: Scroll,
     /// Caps Lock and Num Lock as locked here, sent with each key so the
@@ -359,7 +372,12 @@ struct Session<S> {
 }
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
-    fn new(s: Stream<S>, peer: proto::PeerInfo, purpose: Purpose) -> Result<Self, Error> {
+    fn new(
+        s: Stream<S>,
+        peer: proto::PeerInfo,
+        purpose: Purpose,
+        audio_allowed: bool,
+    ) -> Result<Self, Error> {
         let screen = screen_at(&peer.displays, peer.current_display)
             .or_else(|| screen_at(&peer.displays, 0))
             .ok_or_else(|| Error::other("the other machine named no screen"))?;
@@ -376,6 +394,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             displays: peer.displays,
             pending_display: None,
             view: matches!(purpose, Purpose::View { .. }),
+            audio_allowed,
+            audio_enabled: false,
+            audio_configured: false,
             decoder: None,
             scroll: Scroll::default(),
             locks: Vec::new(),
@@ -386,7 +407,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     async fn run(
         mut self,
         input: &mut UnboundedReceiver<ClientMsg>,
-        mut displays: Option<&mut UnboundedReceiver<i32>>,
+        mut commands: Option<&mut UnboundedReceiver<RustDeskCommand>>,
         events: &mut dyn FnMut(Event),
     ) -> Result<(), Error> {
         events(Event::Connected {
@@ -395,6 +416,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             video: "RustDesk".into(),
         });
         self.report_displays(events, false);
+        if self.view && !self.audio_allowed {
+            events(Event::RustDeskAudio(RustDeskAudio::Permission(false)));
+        }
         loop {
             let deadline = self.pending_display.map(|(_, deadline)| deadline);
             tokio::select! {
@@ -403,16 +427,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                     Some(m) => self.on_input(m).await?,
                     None => return Ok(()),
                 },
-                selected = async {
-                    match displays.as_mut() {
+                command = async {
+                    match commands.as_mut() {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
                 } => {
-                    if let Some(index) = selected {
-                        self.request_display(index, events).await?;
-                    } else {
-                        displays = None;
+                    match command {
+                        Some(RustDeskCommand::Display(index)) => self.request_display(index, events).await?,
+                        Some(RustDeskCommand::Audio(enabled)) => self.set_audio(enabled, events).await?,
+                        None => commands = None,
                     }
                 },
                 () = async {
@@ -427,6 +451,31 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                 }
             }
         }
+    }
+
+    async fn set_audio(
+        &mut self,
+        enabled: bool,
+        events: &mut dyn FnMut(Event),
+    ) -> Result<(), Error> {
+        let enabled = self.view && self.audio_allowed && enabled;
+        if enabled == self.audio_enabled {
+            return Ok(());
+        }
+        self.audio_enabled = enabled;
+        self.audio_configured = false;
+        if !enabled {
+            events(Event::RustDeskAudio(RustDeskAudio::Stop));
+        }
+        self.s
+            .send(&msg(Union::Misc(proto::Misc {
+                union: Some(proto::misc::Union::Option(proto::OptionMessage {
+                    disable_audio: if enabled { proto::NO } else { proto::YES },
+                    ..Default::default()
+                })),
+            })))
+            .await?;
+        Ok(())
     }
 
     fn report_displays(&self, events: &mut dyn FnMut(Event), switch_failed: bool) {
@@ -492,6 +541,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     async fn on_message(&mut self, m: Message, events: &mut dyn FnMut(Event)) -> Result<(), Error> {
         match m.union {
             Some(Union::VideoFrame(f)) if self.view => self.on_video(f, events)?,
+            Some(Union::AudioFrame(frame)) if self.audio_enabled && self.audio_configured => {
+                if !frame.data.is_empty() && frame.data.len() <= 64 * 1024 {
+                    events(Event::RustDeskAudio(RustDeskAudio::Packet(frame.data)));
+                }
+            }
             Some(Union::PeerInfo(info)) if self.view && !info.displays.is_empty() => {
                 if self.displays != info.displays {
                     self.displays = info.displays;
@@ -502,6 +556,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                 self.s.send(&msg(Union::TestDelay(t))).await?;
             }
             Some(Union::Misc(proto::Misc { union: Some(u) })) => match u {
+                proto::misc::Union::PermissionInfo(permission)
+                    if self.view && permission.permission == proto::AUDIO_PERMISSION =>
+                {
+                    self.audio_allowed = permission.enabled;
+                    events(Event::RustDeskAudio(RustDeskAudio::Permission(
+                        permission.enabled,
+                    )));
+                    if !permission.enabled {
+                        self.set_audio(false, events).await?;
+                    }
+                }
+                proto::misc::Union::AudioFormat(format) if self.audio_enabled => {
+                    self.audio_configured = true;
+                    events(Event::RustDeskAudio(RustDeskAudio::Format {
+                        sample_rate: format.sample_rate,
+                        channels: format.channels,
+                    }));
+                }
                 proto::misc::Union::SwitchDisplay(d) => {
                     let screen = Screen {
                         index: d.display,
@@ -526,10 +598,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                         });
                     }
                 }
-                proto::misc::Union::RefreshVideoDisplay(_) => {}
                 proto::misc::Union::CloseReason(why) => {
                     return Err(Error::other(format!("the other machine closed: {why}")));
                 }
+                _ => {}
             },
             _ => {}
         }

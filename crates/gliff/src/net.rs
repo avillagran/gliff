@@ -64,6 +64,8 @@ pub struct Picture {
 /// is deliberately absent: it travels with each `Picture`, so the UI never
 /// maps clicks against a configuration whose frame is not on screen yet.
 pub enum Status {
+    RustDeskAudioPermission(bool),
+    RustDeskAudioError(String),
     RustDeskDisplays {
         displays: Vec<gliff_foreign::RemoteDisplay>,
         active: i32,
@@ -504,16 +506,17 @@ async fn foreign_session(
     status: StdSender<Status>,
     mut input: UnboundedReceiver<ToWorker>,
 ) -> Result<(), gliff_foreign::Error> {
-    use gliff_foreign::{Event, Purpose};
+    use gliff_foreign::{Event, Purpose, RustDeskAudio, RustDeskCommand};
     use std::cell::{Cell, RefCell};
     use std::sync::mpsc::TrySendError;
     use std::time::{Duration, Instant};
 
     let zoom = Rc::new(Cell::new(1u32));
     let (tx, mut rx) = unbounded_channel::<ClientMsg>();
-    let (display_tx, mut display_rx) = unbounded_channel();
+    let (commands, mut command_rx) = unbounded_channel();
     let forward = {
         let zoom = zoom.clone();
+        let commands = commands.clone();
         async move {
             while let Some(msg) = input.recv().await {
                 match msg {
@@ -522,7 +525,10 @@ async fn foreign_session(
                     }
                     ToWorker::Zoom(z) => zoom.set(z),
                     ToWorker::SelectRustDeskDisplay(index) => {
-                        let _ = display_tx.send(index);
+                        let _ = commands.send(RustDeskCommand::Display(index));
+                    }
+                    ToWorker::SetRustDeskAudio(enabled) => {
+                        let _ = commands.send(RustDeskCommand::Audio(enabled));
                     }
                     // The clipboard is not shared with these machines.
                     _ => {}
@@ -537,6 +543,7 @@ async fn foreign_session(
     let mut counted = (Instant::now(), 0u32);
     let mut active_display = None;
     let pending_picture = RefCell::new(None);
+    let playback = RefCell::new(None::<crate::rustdesk_audio::Playback>);
     let frame_waiting = tokio::sync::Notify::new();
     let send_picture = |picture| {
         let deferred = match frames.try_send(picture) {
@@ -549,6 +556,49 @@ async fn foreign_session(
         }
     };
     let mut events = |e: Event| match e {
+        Event::RustDeskAudio(event) => match event {
+            RustDeskAudio::Permission(allowed) => {
+                if !allowed {
+                    playback.take();
+                }
+                let _ = status.send(Status::RustDeskAudioPermission(allowed));
+            }
+            RustDeskAudio::Format {
+                sample_rate,
+                channels,
+            } => {
+                if playback.borrow().as_ref().map(|player| player.format)
+                    != Some((sample_rate, channels))
+                {
+                    playback.take();
+                    let failed = {
+                        let commands = commands.clone();
+                        let status = status.clone();
+                        move |why| {
+                            let _ = commands.send(RustDeskCommand::Audio(false));
+                            let _ = status.send(Status::RustDeskAudioError(why));
+                        }
+                    };
+                    match crate::rustdesk_audio::Playback::start(
+                        &target.host,
+                        sample_rate,
+                        channels,
+                        failed.clone(),
+                    ) {
+                        Ok(player) => *playback.borrow_mut() = Some(player),
+                        Err(error) => failed(error.to_string()),
+                    }
+                }
+            }
+            RustDeskAudio::Packet(bytes) => {
+                if let Some(player) = playback.borrow().as_ref() {
+                    player.packet(bytes);
+                }
+            }
+            RustDeskAudio::Stop => {
+                playback.take();
+            }
+        },
         Event::RustDeskDisplays {
             displays,
             active,
@@ -654,7 +704,7 @@ async fn foreign_session(
                 &login.credentials,
                 purpose,
                 &mut rx,
-                &mut display_rx,
+                &mut command_rx,
                 &mut events,
             )
             .await
@@ -686,14 +736,18 @@ async fn foreign_session(
         }
     };
     tokio::pin!(run, flush_frames);
-    tokio::select! {
+    let ended = tokio::select! {
         ended = &mut run => ended,
         () = forward => tokio::select! {
             ended = &mut run => ended,
             () = &mut flush_frames => unreachable!("frame delivery runs until the session ends"),
         },
         () = &mut flush_frames => unreachable!("frame delivery runs until the session ends"),
+    };
+    if let Some(player) = playback.take() {
+        player.finish().await;
     }
+    ended
 }
 
 /// The decode pipeline: VA-API and Vulkan compute on the GPU, or OpenH264 on

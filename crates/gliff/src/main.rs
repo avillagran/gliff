@@ -17,6 +17,7 @@ mod paintable;
 mod protocol_badge;
 mod recent;
 mod remote_install;
+mod rustdesk_audio;
 mod rustdesk_displays;
 mod secrets;
 mod sound;
@@ -27,7 +28,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeSet;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, sync_channel, Receiver};
 use std::time::{Duration, Instant};
@@ -120,7 +121,7 @@ struct Cli {
 struct App {
     window: adw::ApplicationWindow,
     detached_display: Option<i32>,
-    screen_in_use: Rc<Cell<bool>>,
+    windows: Rc<WindowState>,
     /// The picture, upcast; input controllers attach to it and we measure it.
     video: gtk::Widget,
     /// What the picture shows: the latest frame fitted to the window.
@@ -128,6 +129,7 @@ struct App {
     stats: gtk::Label,
     rustdesk_display_button: gtk::MenuButton,
     rustdesk_display_number: gtk::Label,
+    rustdesk_audio_button: gtk::ToggleButton,
     /// Centred over the picture while the shown session is not streaming:
     /// connecting, reconnecting, an error, or no session at all.
     status: gtk::Label,
@@ -177,6 +179,18 @@ struct App {
     keymap: keymap::Keymap,
 }
 
+#[derive(Default)]
+struct WindowState {
+    screen_in_use: Cell<bool>,
+    // Several windows can show the same machine. Only one plays its sound.
+    rustdesk_audio: RefCell<Option<Listening>>,
+}
+
+struct Listening {
+    window: Weak<App>,
+    session: Weak<Session>,
+}
+
 /// One connection to a machine. Every session keeps streaming while the
 /// window shows another, so switching tabs is instant; only the shown one
 /// gets input.
@@ -186,6 +200,8 @@ struct Session {
     endpoint: Endpoint,
     input_tx: RefCell<Option<OutSender>>,
     rustdesk_displays: RefCell<rustdesk_displays::State>,
+    rustdesk_audio_on: Cell<bool>,
+    rustdesk_audio_allowed: Cell<bool>,
     /// Bumped by every `start_session` and by `stop_session`, so pollers and
     /// delayed reconnects of an earlier worker can tell they are stale.
     generation: Cell<u64>,
@@ -242,6 +258,14 @@ struct Session {
 }
 
 impl Session {
+    fn set_rustdesk_audio(&self, enabled: bool) {
+        if self.rustdesk_audio_on.replace(enabled) != enabled {
+            if let Some(tx) = self.input_tx.borrow().as_ref() {
+                let _ = tx.send(clipboard::ToWorker::SetRustDeskAudio(enabled));
+            }
+        }
+    }
+
     fn reset_resize(&self) {
         self.resize_requested.set((0, 0));
         self.resize_scale.set(0.0);
@@ -253,6 +277,8 @@ impl Session {
             endpoint,
             input_tx: RefCell::new(None),
             rustdesk_displays: RefCell::new(Default::default()),
+            rustdesk_audio_on: Cell::new(false),
+            rustdesk_audio_allowed: Cell::new(true),
             generation: Cell::new(0),
             conn: Cell::new(0),
             retries: Cell::new(0),
@@ -324,8 +350,8 @@ fn main() -> glib::ExitCode {
         gtk::Window::set_default_icon_name(APP_NAME);
         *theme_monitor.borrow_mut() = theme::follow_omarchy_theme();
     });
-    let screen_in_use = Rc::new(Cell::new(false));
-    app.connect_activate(move |app| build_ui(app, &cli, None, screen_in_use.clone()));
+    let windows = Rc::new(WindowState::default());
+    app.connect_activate(move |app| build_ui(app, &cli, None, windows.clone()));
     // GTK owns argv parsing; we already parsed with clap, so pass none.
     let empty: Vec<String> = vec![];
     let code = app.run_with_args(&empty);
@@ -448,7 +474,7 @@ fn build_ui(
     app: &adw::Application,
     cli: &Cli,
     detached: Option<(Rc<Session>, i32)>,
-    screen_in_use: Rc<Cell<bool>>,
+    windows: Rc<WindowState>,
 ) {
     let fullscreen_monitor = if let Some(output) = &cli.fullscreen_output {
         let monitor = gdk::Display::default().and_then(|display| {
@@ -556,6 +582,10 @@ fn build_ui(
         .icon_name("audio-volume-muted-symbolic")
         .visible(false)
         .build();
+    let rustdesk_audio_button = gtk::ToggleButton::builder()
+        .icon_name("audio-volume-muted-symbolic")
+        .visible(false)
+        .build();
     let hide_btn = gtk::Button::builder()
         .icon_name("go-bottom-symbolic")
         .tooltip_text("Hide this window in the bar while it works in the background")
@@ -564,6 +594,7 @@ fn build_ui(
     // A --stdio window is itself the other machine's screen.
     if !cli.stdio {
         header.pack_end(&monitor_btn);
+        header.pack_end(&rustdesk_audio_button);
         if detached_display.is_none() {
             header.pack_end(&sound_btn);
             header.pack_end(&control_btn);
@@ -638,12 +669,13 @@ fn build_ui(
     let ui = Rc::new(App {
         window: window.clone(),
         detached_display,
-        screen_in_use,
+        windows,
         video: video.clone(),
         frame,
         stats: stats.clone(),
         rustdesk_display_button,
         rustdesk_display_number,
+        rustdesk_audio_button,
         status: status.clone(),
         hint,
         hint_generation: Cell::new(0),
@@ -674,6 +706,14 @@ fn build_ui(
     });
     install_input_handlers(&ui, &video, &window, hotkey);
     let resize_timer = RefCell::new(Some(install_resize_handler(&ui)));
+    let weak_ui = Rc::downgrade(&ui);
+    ui.rustdesk_audio_button.connect_clicked(move |_| {
+        if let Some(ui) = weak_ui.upgrade() {
+            if let Some(s) = active(&ui) {
+                set_rustdesk_audio(&ui, &s, !s.rustdesk_audio_on.get());
+            }
+        }
+    });
     if detached_display.is_none() {
         install_address_bar(&ui, &connect_btn);
     }
@@ -744,6 +784,9 @@ fn build_ui(
         }
         if let Some(ui) = weak_ui.upgrade() {
             release_pressed_keys(&ui);
+            if let Some(s) = active(&ui) {
+                set_rustdesk_audio(&ui, &s, false);
+            }
             for session in ui.sessions.borrow_mut().drain(..) {
                 session.generation.set(session.generation.get() + 1);
                 session.input_tx.borrow_mut().take();
@@ -1118,6 +1161,7 @@ fn refresh_tabs(ui: &Rc<App>) {
     if let Some(m) = ui.monitor.borrow().as_ref() {
         m.update_control_button();
     }
+    refresh_rustdesk_audio(ui);
 }
 
 /// A machine's tab: its name, which shows that machine, and a button that
@@ -1372,12 +1416,7 @@ fn open_rustdesk_display_window(ui: &Rc<App>, source: &Session, display: i32) {
     release_pressed_keys(ui);
     let session = Rc::new(Session::new(source.endpoint.clone()));
     *session.credentials.borrow_mut() = Some(credentials);
-    build_ui(
-        &app,
-        &ui.cli,
-        Some((session, display)),
-        ui.screen_in_use.clone(),
-    );
+    build_ui(&app, &ui.cli, Some((session, display)), ui.windows.clone());
 }
 
 fn pause_detached_view(ui: &Rc<App>, session: &Session) {
@@ -1388,6 +1427,61 @@ fn pause_detached_view(ui: &Rc<App>, session: &Session) {
     session.connected.set(false);
 }
 
+fn refresh_rustdesk_audio(ui: &App) {
+    let session = active(ui).filter(|s| {
+        matches!(&s.endpoint, Endpoint::Foreign { target, .. } if target.kind == gliff_foreign::Kind::RustDesk)
+            && s.connected.get()
+    });
+    let button = &ui.rustdesk_audio_button;
+    button.set_visible(session.is_some());
+    let Some(s) = session else {
+        return;
+    };
+    let on = s.rustdesk_audio_on.get();
+    let allowed = s.rustdesk_audio_allowed.get();
+    button.set_sensitive(allowed);
+    button.set_active(on);
+    button.set_icon_name(if on {
+        "audio-volume-high-symbolic"
+    } else {
+        "audio-volume-muted-symbolic"
+    });
+    button.set_tooltip_text(Some(if !allowed {
+        "Audio is disabled on the remote machine"
+    } else if on {
+        "Mute RustDesk audio"
+    } else {
+        "Listen to RustDesk audio"
+    }));
+}
+
+fn set_rustdesk_audio(ui: &Rc<App>, s: &Rc<Session>, enabled: bool) {
+    if enabled {
+        let previous = ui.windows.rustdesk_audio.replace(Some(Listening {
+            window: Rc::downgrade(ui),
+            session: Rc::downgrade(s),
+        }));
+        if let Some(previous) = previous {
+            if let Some(old) = previous.session.upgrade().filter(|old| !Rc::ptr_eq(old, s)) {
+                old.set_rustdesk_audio(false);
+                if let Some(window) = previous.window.upgrade() {
+                    refresh_rustdesk_audio(&window);
+                }
+            }
+        }
+    } else {
+        let mut owner = ui.windows.rustdesk_audio.borrow_mut();
+        if owner
+            .as_ref()
+            .is_some_and(|o| o.session.ptr_eq(&Rc::downgrade(s)))
+        {
+            owner.take();
+        }
+    }
+    s.set_rustdesk_audio(enabled);
+    refresh_rustdesk_audio(ui);
+}
+
 /// Make `s` the session the window shows and sends input to.
 fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
     if let Some(m) = ui.monitor.borrow().as_ref() {
@@ -1396,6 +1490,9 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
     if !is_active(ui, s) {
         release_pressed_keys(ui);
         let previous = ui.active.replace(Some(s.clone()));
+        if let Some(previous) = previous.as_ref() {
+            set_rustdesk_audio(ui, previous, false);
+        }
         move_local_offer(
             previous.as_ref(),
             ui.cli.no_clipboard,
@@ -1430,6 +1527,9 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
 fn show_nothing(ui: &Rc<App>) {
     release_pressed_keys(ui);
     let previous = ui.active.take();
+    if let Some(previous) = previous.as_ref() {
+        set_rustdesk_audio(ui, previous, false);
+    }
     revoke_local_offer(previous.as_ref(), ui.cli.no_clipboard);
     ui.window.set_title(Some("Gliff"));
     show_status(ui, "Not connected");
@@ -1455,6 +1555,7 @@ fn stop_session(ui: &Rc<App>, name: &str) {
     if was_active {
         release_pressed_keys(ui);
     }
+    set_rustdesk_audio(ui, &s, false);
     // Bumping the generation stops its pollers and pending reconnects, and
     // dropping the sender closes the worker's input, which ends it.
     s.generation.set(s.generation.get() + 1);
@@ -1593,6 +1694,10 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
     if let Some(index) = ui.detached_display {
         s.rustdesk_displays.borrow_mut().expect_display(index);
         let _ = input_tx.send(clipboard::ToWorker::SelectRustDeskDisplay(index));
+    }
+    s.rustdesk_audio_allowed.set(true);
+    if s.rustdesk_audio_on.get() {
+        let _ = input_tx.send(clipboard::ToWorker::SetRustDeskAudio(true));
     }
     // Replacing the sender closes the old worker's input, which ends it.
     *s.input_tx.borrow_mut() = Some(input_tx);
@@ -1972,6 +2077,20 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     }
                     if is_active(&ui, &s) {
                         rustdesk_displays::refresh(&ui);
+                    }
+                }
+                Status::RustDeskAudioPermission(allowed) => {
+                    s.rustdesk_audio_allowed.set(allowed);
+                    if !allowed {
+                        set_rustdesk_audio(&ui, &s, false);
+                    }
+                    refresh_rustdesk_audio(&ui);
+                }
+                Status::RustDeskAudioError(why) => {
+                    tracing::warn!(machine = %s.name, %why, "RustDesk audio stopped");
+                    set_rustdesk_audio(&ui, &s, false);
+                    if is_active(&ui, &s) {
+                        show_hint(&ui, &format!("Cannot play RustDesk audio: {why}"));
                     }
                 }
                 // Pointer-mapping geometry (stream_size/view/scale) is not

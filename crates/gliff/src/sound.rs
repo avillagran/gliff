@@ -184,8 +184,20 @@ fn relay(mut from: impl Read, mut to: impl Write) {
 /// The local player's arguments: raw audio on stdin, in a stream named
 /// after the machine it comes from.
 fn player_args(host: &str) -> Vec<String> {
+    pcm_player_args(host, 48000, 2)
+}
+
+pub fn pcm_player_args(host: &str, sample_rate: u32, channels: u32) -> Vec<String> {
     let name = host.replace(['"', '\\'], "");
-    let mut args: Vec<String> = RAW.iter().map(|a| a.to_string()).collect();
+    let mut args = vec![
+        "-a".into(),
+        "--format".into(),
+        "s16".into(),
+        "--rate".into(),
+        sample_rate.to_string(),
+        "--channels".into(),
+        channels.to_string(),
+    ];
     args.extend([
         "--latency".into(),
         LATENCY.into(),

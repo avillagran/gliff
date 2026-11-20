@@ -107,7 +107,7 @@ async fn ask(
             Kind::RustDesk => format!(
                 "The permanent password set in {name}'s RustDesk. Its \"Enable direct IP \
                  access\" option must be on. RustDesk does not encrypt direct IP \
-                 connections: the screen and keys cross the network as they are, so use \
+                 connections: the screen, keys and enabled audio cross the network as they are, so use \
                  it on your own network or through a VPN. The password itself is not sent."
             ),
         },

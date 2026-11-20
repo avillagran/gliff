@@ -448,7 +448,7 @@ async fn switches_monitors_and_routes_input_to_the_decoded_picture() -> anyhow::
         .await?;
         s.send(&video(1)).await?;
         expect_pointer(&mut s, -54, -28).await?;
-        return_switch.send(0)?;
+        return_switch.send(RustDeskCommand::Display(0))?;
         expect_switch(&mut s, 0).await?;
         s.send(&video(0)).await?;
         expect_pointer(&mut s, 10, 20).await?;
@@ -471,7 +471,7 @@ async fn switches_monitors_and_routes_input_to_the_decoded_picture() -> anyhow::
         Event::Frame { .. } => {
             pictures.push(active.unwrap());
             match pictures.as_slice() {
-                [0] => select.send(1).unwrap(),
+                [0] => select.send(RustDeskCommand::Display(1)).unwrap(),
                 [0, 1] => motion
                     .send(ClientMsg::PointerMotion { x: 10.0, y: 20.0 })
                     .unwrap(),
@@ -504,5 +504,84 @@ async fn switches_monitors_and_routes_input_to_the_decoded_picture() -> anyhow::
     server.await??;
     assert!(result.is_err(), "fixture closes the connection");
     assert_eq!(pictures, [0, 1, 0]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn opts_in_to_audio_and_ignores_packets_after_muting() -> anyhow::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let server = tokio::spawn(serve(listener, |mut s, login| async move {
+        assert_eq!(login.option.unwrap().disable_audio, proto::YES);
+        s.send(&msg(Union::LoginResponse(proto::LoginResponse {
+            union: Some(proto::login_response::Union::PeerInfo(peer_info())),
+        })))
+        .await?;
+        let packet = msg(Union::AudioFrame(proto::AudioFrame {
+            data: vec![1, 2, 3],
+        }));
+        s.send(&packet).await?;
+        let option = |disable_audio| {
+            msg(Union::Misc(proto::Misc {
+                union: Some(proto::misc::Union::Option(proto::OptionMessage {
+                    disable_audio,
+                    ..Default::default()
+                })),
+            }))
+        };
+        assert_eq!(s.recv().await?.union, option(proto::NO).union);
+        s.send(&msg(Union::Misc(proto::Misc {
+            union: Some(proto::misc::Union::AudioFormat(proto::AudioFormat {
+                sample_rate: 48000,
+                channels: 2,
+            })),
+        })))
+        .await?;
+        s.send(&packet).await?;
+        assert_eq!(s.recv().await?.union, option(proto::YES).union);
+        s.send(&packet).await?;
+        Ok(())
+    }));
+
+    let (_input_tx, mut input) = unbounded_channel();
+    let (commands, mut selected) = unbounded_channel();
+    let (mut formats, mut packets, mut stops) = (0, 0, 0);
+    let mut events = |event| match event {
+        Event::Connected { .. } => commands.send(RustDeskCommand::Audio(true)).unwrap(),
+        Event::RustDeskAudio(RustDeskAudio::Format {
+            sample_rate,
+            channels,
+        }) => {
+            assert_eq!((sample_rate, channels), (48000, 2));
+            formats += 1;
+        }
+        Event::RustDeskAudio(RustDeskAudio::Packet(packet)) => {
+            assert_eq!(packet, [1, 2, 3]);
+            packets += 1;
+            commands.send(RustDeskCommand::Audio(false)).unwrap();
+        }
+        Event::RustDeskAudio(RustDeskAudio::Stop) => stops += 1,
+        _ => {}
+    };
+    let target = target(port);
+    let credentials = credentials(PASSWORD);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run(
+            &target,
+            &credentials,
+            Purpose::View {
+                width: 1280,
+                height: 720,
+            },
+            &mut input,
+            Some(&mut selected),
+            &mut events,
+        ),
+    )
+    .await?;
+    server.await??;
+    assert!(result.is_err(), "fixture closes the connection");
+    assert_eq!((formats, packets, stops), (1, 1, 1));
     Ok(())
 }

@@ -21,11 +21,13 @@ depends=(
   'libxkbcommon'
   'mesa'
   'openssh'
+  'opus'
   'vulkan-icd-loader'
   'wayland'
 )
 makedepends=('cargo' 'pkgconf' 'nasm')
 optdepends=('vulkan-radeon: Vulkan compute on AMD'
+            'pipewire: Play remote desktop audio'
             'vulkan-intel: Vulkan compute on Intel'
             'intel-media-driver: VA-API H.264 codec on Intel'
             'vulkan-tools: vulkaninfo for debugging'

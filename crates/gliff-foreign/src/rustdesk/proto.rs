@@ -7,7 +7,7 @@
 pub struct Message {
     #[prost(
         oneof = "message::Union",
-        tags = "3, 4, 5, 6, 7, 8, 9, 10, 15, 19, 25, 27"
+        tags = "3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 19, 25, 27"
     )]
     pub union: Option<message::Union>,
 }
@@ -31,6 +31,8 @@ pub mod message {
         Hash(super::Hash),
         #[prost(message, tag = "10")]
         MouseEvent(super::MouseEvent),
+        #[prost(message, tag = "11")]
+        AudioFrame(super::AudioFrame),
         #[prost(message, tag = "15")]
         KeyEvent(super::KeyEvent),
         #[prost(message, tag = "19")]
@@ -105,6 +107,7 @@ pub struct LoginRequest {
 pub const IMAGE_QUALITY_LOW: i32 = 2;
 /// `BoolOption.Yes`.
 pub const YES: i32 = 2;
+pub const NO: i32 = 1;
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct OptionMessage {
@@ -295,7 +298,7 @@ pub struct TestDelay {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Misc {
-    #[prost(oneof = "misc::Union", tags = "5, 9, 31")]
+    #[prost(oneof = "misc::Union", tags = "5, 6, 7, 8, 9, 31")]
     pub union: Option<misc::Union>,
 }
 
@@ -304,11 +307,41 @@ pub mod misc {
     pub enum Union {
         #[prost(message, tag = "5")]
         SwitchDisplay(super::SwitchDisplay),
+        #[prost(message, tag = "6")]
+        PermissionInfo(super::PermissionInfo),
+        #[prost(message, tag = "7")]
+        Option(super::OptionMessage),
+        #[prost(message, tag = "8")]
+        AudioFormat(super::AudioFormat),
         #[prost(string, tag = "9")]
         CloseReason(String),
         #[prost(int32, tag = "31")]
         RefreshVideoDisplay(i32),
     }
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct PermissionInfo {
+    #[prost(int32, tag = "1")]
+    pub permission: i32,
+    #[prost(bool, tag = "2")]
+    pub enabled: bool,
+}
+
+pub const AUDIO_PERMISSION: i32 = 3;
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct AudioFormat {
+    #[prost(uint32, tag = "1")]
+    pub sample_rate: u32,
+    #[prost(uint32, tag = "2")]
+    pub channels: u32,
+}
+
+#[derive(Clone, PartialEq, prost::Message)]
+pub struct AudioFrame {
+    #[prost(bytes = "vec", tag = "1")]
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, PartialEq, prost::Message)]
