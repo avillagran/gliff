@@ -493,18 +493,17 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     header.pack_start(&add_revealer);
     header.pack_end(&fullscreen_btn);
     header.pack_end(&stats_btn);
-    let rustdesk_display_label = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let rustdesk_display_label = gtk::Box::new(gtk::Orientation::Horizontal, 3);
     rustdesk_display_label.append(&gtk::Image::from_icon_name(
         "video-joined-displays-symbolic",
     ));
     let rustdesk_display_number = gtk::Label::new(None);
-    rustdesk_display_number.add_css_class("heading");
+    rustdesk_display_number.add_css_class("remote-display-badge");
+    rustdesk_display_number.set_valign(gtk::Align::Center);
     rustdesk_display_number.set_visible(false);
     rustdesk_display_label.append(&rustdesk_display_number);
-    rustdesk_display_label.append(&gtk::Label::new(Some("Remote displays")));
     let rustdesk_display_button = gtk::MenuButton::builder()
         .child(&rustdesk_display_label)
-        .always_show_arrow(true)
         .tooltip_text("Choose RustDesk monitor")
         .visible(false)
         .build();
@@ -677,6 +676,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         ".machine-tab > button.tab-action:hover { color: currentColor; }",
         ".status-dot { min-width: 6px; min-height: 6px; border-radius: 50%; border: 1.5px solid alpha(currentColor, 0.6); }",
         ".status-dot.connected { background: var(--success-color); border-color: var(--success-color); }",
+        ".remote-display-badge { background: alpha(currentColor, 0.16); border-radius: 999px; font-size: 0.8em; font-weight: bold; min-width: 1em; padding: 0 3px; }",
     ));
     if let Some(display) = gdk::Display::default() {
         gtk::style_context_add_provider_for_display(
