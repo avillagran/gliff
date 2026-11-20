@@ -29,6 +29,8 @@ pub struct Target {
     pub host: String,
     /// The other machine's gliff.
     pub remote_bin: String,
+    /// A specific connector on the receiving machine, when requested.
+    pub output: Option<String>,
 }
 
 /// A running screen on another machine. Dropping it stops the screen.
@@ -65,8 +67,8 @@ impl Display {
             .spawn()?;
         let to_server = server.stdin.take().expect("piped stdin");
         let from_server = server.stdout.take().expect("piped stdout");
-        let ssh = Command::new("ssh")
-            .args(["-T", "-o", "Compression=no", "-o", "IPQoS=lowdelay"])
+        let mut ssh = Command::new("ssh");
+        ssh.args(["-T", "-o", "Compression=no", "-o", "IPQoS=lowdelay"])
             .arg("--")
             .arg(&target.host)
             // The remote shell joins these words and parses them again: the
@@ -74,7 +76,12 @@ impl Display {
             // `--server-bin` is, and the name is a plain word.
             .args(["sh", "-c", &format!("'{REMOTE_SCRIPT}'"), "gliff"])
             .arg(&target.remote_bin)
-            .arg(this_machine())
+            .arg(this_machine());
+        if let Some(output) = &target.output {
+            // OpenSSH sends command arguments to the remote shell as text.
+            ssh.arg(format!("'{}'", output.replace('\'', "'\\''")));
+        }
+        let ssh = ssh
             .stdin(Stdio::from(from_server))
             .stdout(Stdio::from(to_server))
             .stderr(Stdio::piped())
@@ -158,7 +165,9 @@ impl Drop for Display {
 }
 
 /// Runs on the other machine as `sh -c` with its gliff as `$1` and this
-/// machine's name as `$2`. A gliff that knows `--stdio` takes the stream
+/// machine's name as `$2`. When given a connector in `$3`, require the peer
+/// to support it so a different screen cannot be taken by mistake.
+/// A gliff that knows `--stdio` takes the stream
 /// itself. An older one gets `ssh` on its PATH replaced by a relay: the
 /// stream reaches it as fds 3 and 4, and when the stream ends the relay
 /// closes the window, as `--stdio` does. Its window is made fullscreen
@@ -169,7 +178,15 @@ impl Drop for Display {
 /// on the CPU.
 ///
 /// It must hold no `'` or `\`, which the remote login shell would not keep.
-const REMOTE_SCRIPT: &str = r#"if "$1" --help 2>/dev/null | grep -q -- --stdio; then exec "$1" --stdio --fullscreen; fi
+const REMOTE_SCRIPT: &str = r#"if [ -n "$3" ]; then
+  if ! command -v "$1" >/dev/null 2>&1; then exit 127; fi
+  if ! "$1" --help 2>/dev/null | grep -q -- --fullscreen-output; then
+    echo "Update Gliff on the receiving machine to select a display connector" >&2
+    exit 2
+  fi
+  exec "$1" --stdio --fullscreen-output "$3"
+fi
+if "$1" --help 2>/dev/null | grep -q -- --stdio; then exec "$1" --stdio --fullscreen; fi
 d=$(mktemp -d) || exit 1
 trap "rm -rf $d" EXIT
 cat >"$d/ssh" <<"END" || exit 1

@@ -42,6 +42,13 @@ impl State {
         self.requested = Some(index);
     }
 
+    pub fn name(&self, index: i32) -> Option<&str> {
+        self.displays
+            .iter()
+            .find(|display| display.index == index)
+            .map(|display| display.name.as_str())
+    }
+
     pub fn switching(&self) -> bool {
         self.requested.is_some()
     }

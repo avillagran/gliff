@@ -32,6 +32,10 @@ pub struct Settings {
     pub alignment: String,
     /// While driven from here, its sound plays here.
     pub sound: bool,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    receiver: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    output: String,
 }
 
 impl Default for Settings {
@@ -40,6 +44,8 @@ impl Default for Settings {
             side: "right".into(),
             alignment: "start".into(),
             sound: false,
+            receiver: String::new(),
+            output: String::new(),
         }
     }
 }
@@ -61,6 +67,29 @@ impl Settings {
         SIDES.iter().any(|(s, ..)| *s == self.side)
             && ALIGNMENTS.iter().any(|(a, _)| *a == self.alignment)
     }
+
+    fn has_receiver(&self) -> bool {
+        valid_receiver(&self.receiver) && valid_output(&self.output)
+    }
+}
+
+fn valid_receiver(text: &str) -> bool {
+    let (user, host) = text.split_once('@').unwrap_or(("", text));
+    (!text.contains('@') || !user.is_empty())
+        && user
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        && host.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '[' || c == ':')
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:[]".contains(&b))
+}
+
+fn valid_output(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && text
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
 }
 
 type Running = Rc<RefCell<Option<Display>>>;
@@ -93,6 +122,7 @@ pub struct Controller {
     settings_button: gtk::Button,
     /// The machine whose screen is in use, and its display.
     running: RefCell<Option<(String, Running)>>,
+    closing: Cell<bool>,
     /// The machine whose screen was used last. Its tab stays the selected
     /// one while no other machine is shown, so the button and the settings
     /// still apply to it after the screen stops.
@@ -127,6 +157,7 @@ impl Controller {
             button: button.clone(),
             settings_button: settings.clone(),
             running: RefCell::new(None),
+            closing: Cell::new(false),
             chosen: RefCell::new(None),
             message: RefCell::new(String::new()),
             control_button: control_button.clone(),
@@ -165,7 +196,10 @@ impl Controller {
                 c.note("Select a machine's tab first.");
                 return;
             };
-            if let Some(Ok(target)) = gliff_foreign::Target::parse(&name) {
+            let detached =
+                c.ui.upgrade()
+                    .is_some_and(|ui| ui.detached_display.is_some());
+            if let Some(Ok(target)) = gliff_foreign::Target::parse(&name).filter(|_| !detached) {
                 c.note(&format!(
                     "{name} runs {}, not gliff: it cannot show this computer's apps. \
                      Control it with the mouse button instead.",
@@ -174,7 +208,9 @@ impl Controller {
                 return;
             }
             let saved = c.saved(&name);
-            match saved.filter(Settings::valid) {
+            match saved
+                .filter(|settings| settings.valid() && (!detached || settings.has_receiver()))
+            {
                 Some(settings) => c.start(name, &settings),
                 None => c.configure(name, Then::UseScreen),
             }
@@ -205,6 +241,7 @@ impl Controller {
         let weak = Rc::downgrade(&this);
         ui.window.connect_close_request(move |_| {
             if let Some(c) = weak.upgrade() {
+                c.closing.set(true);
                 c.stop();
                 // Joined here, so each pointer is back before the app goes.
                 c.driven.borrow_mut().clear();
@@ -245,7 +282,15 @@ impl Controller {
 
     fn saved(&self, name: &str) -> Option<Settings> {
         let ui = self.ui.upgrade()?;
-        Config::load(&ui.config_path).monitors.get(name).cloned()
+        let config = Config::load(&ui.config_path);
+        match ui.detached_display {
+            Some(index) => config
+                .rustdesk_monitors
+                .get(name)?
+                .get(&index.to_string())
+                .cloned(),
+            None => config.monitors.get(name).cloned(),
+        }
     }
 
     /// Whether `name`'s screen is in use.
@@ -495,7 +540,26 @@ impl Controller {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
-        let saved = self.saved(&name).unwrap_or_default();
+        let detached = ui.detached_display;
+        let saved = self.saved(&name).unwrap_or_else(|| {
+            let mut settings = Settings::default();
+            if let Some(index) = detached {
+                if let Some(Ok(target)) = gliff_foreign::Target::parse(&name) {
+                    settings.receiver = target.host;
+                }
+                if let Some(session) = crate::find_session(&ui, &name) {
+                    if let Some(output) = session
+                        .rustdesk_displays
+                        .borrow()
+                        .name(index)
+                        .filter(|name| valid_output(name))
+                    {
+                        settings.output = output.to_owned();
+                    }
+                }
+            }
+            settings
+        });
         let (title, body) = match then {
             Then::Control => (
                 "Control with this mouse",
@@ -546,6 +610,31 @@ impl Controller {
         // anywhere along it.
         align.set_visible(then != Then::Control);
         content.append(&align);
+        let receiver = detached.map(|index| {
+            let explanation = gtk::Label::new(Some(&format!(
+                "To use monitor {} as an extension, connect to a compatible Gliff receiver over SSH.",
+                i64::from(index) + 1
+            )));
+            explanation.set_wrap(true);
+            explanation.set_xalign(0.0);
+            content.append(&explanation);
+            let ssh = adw::EntryRow::builder()
+                .title("SSH address (user@host)")
+                .text(&saved.receiver)
+                .build();
+            let output = adw::EntryRow::builder()
+                .title("Display connector (e.g. DP-1)")
+                .text(&saved.output)
+                .build();
+            let fields = gtk::ListBox::builder()
+                .css_classes(["boxed-list"])
+                .selection_mode(gtk::SelectionMode::None)
+                .build();
+            fields.append(&ssh);
+            fields.append(&output);
+            content.append(&fields);
+            (ssh, output)
+        });
         dialog.set_extra_child(Some(&content));
         dialog.add_responses(&[
             ("cancel", "Cancel"),
@@ -563,7 +652,7 @@ impl Controller {
         dialog.set_close_response("cancel");
         let c = self.clone();
         glib::spawn_future_local(async move {
-            if dialog.choose_future(Some(&ui.window)).await != "save" {
+            if dialog.choose_future(Some(&ui.window)).await != "save" || c.closing.get() {
                 return;
             }
             let settings = Settings {
@@ -574,9 +663,30 @@ impl Controller {
                     .into(),
                 alignment: ALIGNMENTS[(align.selected() as usize).min(2)].0.into(),
                 sound: saved.sound,
+                receiver: receiver
+                    .as_ref()
+                    .map_or_else(String::new, |(ssh, _)| ssh.text().trim().to_owned()),
+                output: receiver
+                    .as_ref()
+                    .map_or_else(String::new, |(_, output)| output.text().trim().to_owned()),
             };
+            if detached.is_some()
+                && (then == Then::UseScreen && !settings.has_receiver()
+                    || !settings.receiver.is_empty() && !valid_receiver(&settings.receiver)
+                    || !settings.output.is_empty() && !valid_output(&settings.output))
+            {
+                c.note("Enter a valid SSH address and display connector to use this screen.");
+                return;
+            }
             let saved = Config::update(&ui.config_path, |c| {
-                c.monitors.insert(name.clone(), settings.clone());
+                if let Some(index) = detached {
+                    c.rustdesk_monitors
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(index.to_string(), settings.clone());
+                } else {
+                    c.monitors.insert(name.clone(), settings.clone());
+                }
             });
             if let Err(e) = saved {
                 c.note(&format!("Cannot save the screen settings: {e}"));
@@ -594,7 +704,11 @@ impl Controller {
         let Some(ui) = self.ui.upgrade() else {
             return;
         };
-        if self.running.borrow().is_some() {
+        if self.closing.get() || self.running.borrow().is_some() {
+            return;
+        }
+        if ui.screen_in_use.get() {
+            self.note("Stop using the screen in the other Gliff window first.");
             return;
         }
         if self.drives(&name) {
@@ -603,19 +717,48 @@ impl Controller {
         }
         // Showing that machine here while it shows this screen would put
         // the screen inside itself. Its tab stays selected, not the next one.
-        crate::show_lending(&ui, &name);
+        let detached = if ui.detached_display.is_some() {
+            if !settings.has_receiver() {
+                return;
+            }
+            let Some(session) = crate::find_session(&ui, &name) else {
+                return;
+            };
+            Some(session)
+        } else {
+            crate::show_lending(&ui, &name);
+            None
+        };
         let target = Target {
-            host: name.clone(),
+            host: if detached.is_some() {
+                settings.receiver.clone()
+            } else {
+                name.clone()
+            },
             remote_bin: ui.cli.remote_gliff.clone(),
+            output: detached.as_ref().map(|_| settings.output.clone()),
         };
         let weak = Rc::downgrade(self);
+        let screen_in_use = ui.screen_in_use.clone();
         let ended_name = name.clone();
         let started = Display::start(&target, &settings.side, &settings.alignment, move |why| {
+            screen_in_use.set(false);
             let Some(c) = weak.upgrade() else {
                 return;
             };
             if c.owns(&ended_name) {
                 c.running.borrow_mut().take();
+            }
+            if c.closing.get() {
+                return;
+            }
+            if let Some(ui) = c.ui.upgrade().filter(|ui| ui.detached_display.is_some()) {
+                if let Some(session) = crate::find_session(&ui, &ended_name) {
+                    session.retries.set(0);
+                    session.gave_up.set(false);
+                    crate::start_session(ui.clone(), session.clone());
+                    crate::show_session(&ui, &session);
+                }
             }
             c.note(&match why {
                 Some(why) => format!("{ended_name}'s screen stopped: {why}"),
@@ -625,6 +768,11 @@ impl Controller {
         });
         match started {
             Ok(display) => {
+                ui.screen_in_use.set(true);
+                if let Some(session) = detached {
+                    self.choose(&name);
+                    crate::pause_detached_view(&ui, &session);
+                }
                 *self.running.borrow_mut() = Some((name.clone(), display));
                 self.note(&format!("Using {name}'s screen. Stop gives it back."));
             }

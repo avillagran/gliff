@@ -15,6 +15,12 @@ pub struct Config {
     /// one.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub monitors: std::collections::BTreeMap<String, crate::monitor::Settings>,
+    /// Layout and receiver for an individually opened RustDesk display.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub rustdesk_monitors: std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, crate::monitor::Settings>,
+    >,
     /// The machines with a running session, in tab order of opening.
     #[serde(default)]
     pub open: Vec<String>,
@@ -123,6 +129,7 @@ impl Config {
 
     pub fn forget(&mut self, machine: &str) {
         self.monitors.remove(machine);
+        self.rustdesk_monitors.remove(machine);
         self.certificates.remove(machine);
         self.machines.retain(|m| m != machine);
         self.set_open(machine, false);
@@ -156,6 +163,11 @@ impl Config {
         if let Some(settings) = self.monitors.remove(old) {
             self.monitors.entry(new.to_string()).or_insert(settings);
         }
+        if let Some(settings) = self.rustdesk_monitors.remove(old) {
+            self.rustdesk_monitors
+                .entry(new.to_string())
+                .or_insert(settings);
+        }
         self.certificates.remove(old);
         let was_open = self.open.iter().any(|m| m == old);
         self.set_open(old, false);
@@ -181,6 +193,29 @@ impl Config {
         self.machines.insert(to, moved);
         true
     }
+}
+
+#[test]
+fn individual_display_positions_round_trip_without_changing_the_machine_position() {
+    use crate::monitor::Settings;
+
+    let mut config = Config::default();
+    let name = "rustdesk://workstation";
+    let mut monitor = Settings::default();
+    monitor.side = "left".into();
+    config.monitors.insert(name.to_owned(), monitor);
+    let mut second = Settings::default();
+    second.side = "above".into();
+    config.rustdesk_monitors.insert(
+        name.to_owned(),
+        [("0".into(), Settings::default()), ("1".into(), second)].into(),
+    );
+
+    let serialized = toml::to_string(&config).unwrap();
+    let mut restored = Config::parse(&serialized).unwrap();
+    assert_eq!(restored, config);
+    restored.forget(name);
+    assert!(restored.rustdesk_monitors.is_empty());
 }
 
 #[cfg(test)]

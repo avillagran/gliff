@@ -77,6 +77,9 @@ struct Cli {
     /// Open the window fullscreen.
     #[arg(long)]
     fullscreen: bool,
+    /// Put a --stdio receiver on this local display connector (e.g. DP-1).
+    #[arg(long, requires = "stdio")]
+    fullscreen_output: Option<String>,
     /// Remote gliff-server path.
     #[arg(long, default_value = "gliff-server")]
     server_bin: String,
@@ -117,6 +120,7 @@ struct Cli {
 struct App {
     window: adw::ApplicationWindow,
     detached_display: Option<i32>,
+    screen_in_use: Rc<Cell<bool>>,
     /// The picture, upcast; input controllers attach to it and we measure it.
     video: gtk::Widget,
     /// What the picture shows: the latest frame fitted to the window.
@@ -320,7 +324,8 @@ fn main() -> glib::ExitCode {
         gtk::Window::set_default_icon_name(APP_NAME);
         *theme_monitor.borrow_mut() = theme::follow_omarchy_theme();
     });
-    app.connect_activate(move |app| build_ui(app, &cli, None));
+    let screen_in_use = Rc::new(Cell::new(false));
+    app.connect_activate(move |app| build_ui(app, &cli, None, screen_in_use.clone()));
     // GTK owns argv parsing; we already parsed with clap, so pass none.
     let empty: Vec<String> = vec![];
     let code = app.run_with_args(&empty);
@@ -439,7 +444,30 @@ fn window_title(endpoint: &Endpoint) -> String {
 
 /// The one window: a header with a tab per machine and the address bar, the
 /// remote screen (black until connected) with any status over it.
-fn build_ui(app: &adw::Application, cli: &Cli, detached: Option<(Rc<Session>, i32)>) {
+fn build_ui(
+    app: &adw::Application,
+    cli: &Cli,
+    detached: Option<(Rc<Session>, i32)>,
+    screen_in_use: Rc<Cell<bool>>,
+) {
+    let fullscreen_monitor = if let Some(output) = &cli.fullscreen_output {
+        let monitor = gdk::Display::default().and_then(|display| {
+            display
+                .monitors()
+                .iter::<gdk::Monitor>()
+                .filter_map(Result::ok)
+                .find(|monitor| monitor.connector().as_deref() == Some(output.as_str()))
+        });
+        let Some(monitor) = monitor else {
+            eprintln!("gliff: no display connector named {output:?} on this machine");
+            STDIO_FAILED.store(true, Ordering::Relaxed);
+            app.quit();
+            return;
+        };
+        Some(monitor)
+    } else {
+        None
+    };
     let detached_display = detached.as_ref().map(|(_, display)| *display);
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -534,12 +562,16 @@ fn build_ui(app: &adw::Application, cli: &Cli, detached: Option<(Rc<Session>, i3
         .visible(false)
         .build();
     // A --stdio window is itself the other machine's screen.
-    if !cli.stdio && detached_display.is_none() {
+    if !cli.stdio {
         header.pack_end(&monitor_btn);
-        header.pack_end(&sound_btn);
-        header.pack_end(&control_btn);
+        if detached_display.is_none() {
+            header.pack_end(&sound_btn);
+            header.pack_end(&control_btn);
+        }
         header.pack_end(&monitor_settings_btn);
-        header.pack_end(&hide_btn);
+        if detached_display.is_none() {
+            header.pack_end(&hide_btn);
+        }
     }
 
     let stats = gtk::Label::builder()
@@ -606,6 +638,7 @@ fn build_ui(app: &adw::Application, cli: &Cli, detached: Option<(Rc<Session>, i3
     let ui = Rc::new(App {
         window: window.clone(),
         detached_display,
+        screen_in_use,
         video: video.clone(),
         frame,
         stats: stats.clone(),
@@ -643,6 +676,8 @@ fn build_ui(app: &adw::Application, cli: &Cli, detached: Option<(Rc<Session>, i3
     let resize_timer = RefCell::new(Some(install_resize_handler(&ui)));
     if detached_display.is_none() {
         install_address_bar(&ui, &connect_btn);
+    }
+    if !ui.cli.stdio {
         *ui.monitor.borrow_mut() = Some(monitor::Controller::install(
             &ui,
             &monitor_btn,
@@ -764,7 +799,9 @@ fn build_ui(app: &adw::Application, cli: &Cli, detached: Option<(Rc<Session>, i3
         *ui.local_clipboard.borrow_mut() = watch;
     }
 
-    if cli.fullscreen {
+    if let Some(monitor) = fullscreen_monitor {
+        window.fullscreen_on_monitor(&monitor);
+    } else if cli.fullscreen {
         window.fullscreen();
     }
     window.present();
@@ -1255,6 +1292,9 @@ fn select_tab(ui: &Rc<App>, name: &str) {
     // A machine lending its screen is not also shown here unless asked
     // for: connecting to it would show this screen inside itself.
     let lending = ui.monitor.borrow().as_ref().is_some_and(|m| m.owns(name));
+    if lending && ui.detached_display.is_some() {
+        return;
+    }
     if lending && find_session(ui, name).is_none() {
         show_lending(ui, name);
         return;
@@ -1327,7 +1367,20 @@ fn open_rustdesk_display_window(ui: &Rc<App>, source: &Session, display: i32) {
     release_pressed_keys(ui);
     let session = Rc::new(Session::new(source.endpoint.clone()));
     *session.credentials.borrow_mut() = Some(credentials);
-    build_ui(&app, &ui.cli, Some((session, display)));
+    build_ui(
+        &app,
+        &ui.cli,
+        Some((session, display)),
+        ui.screen_in_use.clone(),
+    );
+}
+
+fn pause_detached_view(ui: &Rc<App>, session: &Session) {
+    show_nothing(ui);
+    session.generation.set(session.generation.get() + 1);
+    session.input_tx.borrow_mut().take();
+    session.last_frame.borrow_mut().take();
+    session.connected.set(false);
 }
 
 /// Make `s` the session the window shows and sends input to.
