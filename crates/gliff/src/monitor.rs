@@ -169,8 +169,11 @@ impl Controller {
             sound_button: sound_button.clone(),
             syncing: Cell::new(false),
         });
-        let c = this.clone();
+        let weak = Rc::downgrade(&this);
         sound_button.connect_toggled(move |b| {
+            let Some(c) = weak.upgrade() else {
+                return;
+            };
             if c.syncing.get() {
                 return;
             }
@@ -184,10 +187,17 @@ impl Controller {
             }
             c.remember_sound(&name, b.is_active());
         });
-        let c = this.clone();
-        hide_button.connect_clicked(move |_| c.hide_window());
-        let c = this.clone();
+        let weak = Rc::downgrade(&this);
+        hide_button.connect_clicked(move |_| {
+            if let Some(c) = weak.upgrade() {
+                c.hide_window();
+            }
+        });
+        let weak = Rc::downgrade(&this);
         button.connect_clicked(move |_| {
+            let Some(c) = weak.upgrade() else {
+                return;
+            };
             if c.running.borrow().is_some() {
                 c.stop();
                 return;
@@ -215,13 +225,20 @@ impl Controller {
                 None => c.configure(name, Then::UseScreen),
             }
         });
-        let c = this.clone();
-        settings.connect_clicked(move |_| match c.selected() {
-            Some(name) => c.configure(name, Then::Nothing),
-            None => c.note("Select a machine's tab first."),
+        let weak = Rc::downgrade(&this);
+        settings.connect_clicked(move |_| {
+            if let Some(c) = weak.upgrade() {
+                match c.selected() {
+                    Some(name) => c.configure(name, Then::Nothing),
+                    None => c.note("Select a machine's tab first."),
+                }
+            }
         });
-        let c = this.clone();
+        let weak = Rc::downgrade(&this);
         control_button.connect_clicked(move |_| {
+            let Some(c) = weak.upgrade() else {
+                return;
+            };
             let Some(name) = c.selected() else {
                 c.note("Select a machine's tab first.");
                 return;
