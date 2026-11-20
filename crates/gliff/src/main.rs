@@ -492,8 +492,14 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     header.pack_start(&add_revealer);
     header.pack_end(&fullscreen_btn);
     header.pack_end(&stats_btn);
+    let rustdesk_display_label = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    rustdesk_display_label.append(&gtk::Image::from_icon_name(
+        "video-joined-displays-symbolic",
+    ));
+    rustdesk_display_label.append(&gtk::Label::new(Some("Remote displays")));
     let rustdesk_display_button = gtk::MenuButton::builder()
-        .icon_name("video-display-symbolic")
+        .child(&rustdesk_display_label)
+        .always_show_arrow(true)
         .tooltip_text("Choose RustDesk monitor")
         .visible(false)
         .build();
