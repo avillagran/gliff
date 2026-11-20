@@ -693,6 +693,11 @@ fn build_ui(
     {
         let window = window.clone();
         fullscreen_btn.connect_toggled(move |b| {
+            // The window also syncs this button when its state changes.
+            // Reissuing fullscreen there would discard the requested monitor.
+            if b.is_active() == window.is_fullscreen() {
+                return;
+            }
             if b.is_active() {
                 window.fullscreen();
             } else {
