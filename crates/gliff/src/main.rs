@@ -122,6 +122,7 @@ struct App {
     frame: paintable::FramePaintable,
     stats: gtk::Label,
     rustdesk_display_button: gtk::MenuButton,
+    rustdesk_display_number: gtk::Label,
     /// Centred over the picture while the shown session is not streaming:
     /// connecting, reconnecting, an error, or no session at all.
     status: gtk::Label,
@@ -496,6 +497,10 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     rustdesk_display_label.append(&gtk::Image::from_icon_name(
         "video-joined-displays-symbolic",
     ));
+    let rustdesk_display_number = gtk::Label::new(None);
+    rustdesk_display_number.add_css_class("heading");
+    rustdesk_display_number.set_visible(false);
+    rustdesk_display_label.append(&rustdesk_display_number);
     rustdesk_display_label.append(&gtk::Label::new(Some("Remote displays")));
     let rustdesk_display_button = gtk::MenuButton::builder()
         .child(&rustdesk_display_label)
@@ -599,6 +604,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         frame,
         stats: stats.clone(),
         rustdesk_display_button,
+        rustdesk_display_number,
         status: status.clone(),
         hint,
         hint_generation: Cell::new(0),

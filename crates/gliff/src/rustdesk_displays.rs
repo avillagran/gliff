@@ -65,6 +65,18 @@ pub fn refresh(ui: &Rc<App>) {
         return;
     }
 
+    // Use the same numbering as the menu, based on the last painted frame.
+    let number = state.shown.map(|index| i64::from(index) + 1);
+    ui.rustdesk_display_number.set_visible(number.is_some());
+    if let Some(number) = number {
+        ui.rustdesk_display_number.set_text(&number.to_string());
+        button.set_tooltip_text(Some(&format!(
+            "Choose RustDesk monitor (showing monitor {number})"
+        )));
+    } else {
+        button.set_tooltip_text(Some("Choose RustDesk monitor"));
+    }
+
     let popover = gtk::Popover::new();
     let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
     for display in &state.displays {
