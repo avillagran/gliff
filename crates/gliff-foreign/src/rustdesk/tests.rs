@@ -400,6 +400,12 @@ async fn switches_monitors_and_routes_input_to_the_decoded_picture() -> anyhow::
                 })),
             }))
         );
+        assert_eq!(
+            s.recv().await?.union,
+            Some(Union::Misc(proto::Misc {
+                union: Some(proto::misc::Union::RefreshVideoDisplay(index)),
+            }))
+        );
         Ok(())
     }
     async fn expect_pointer(s: &mut Stream<TcpStream>, x: i32, y: i32) -> anyhow::Result<()> {

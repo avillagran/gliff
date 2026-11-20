@@ -63,7 +63,8 @@ front of you.
 When a RustDesk tab receives more than one monitor, its header shows a monitor
 picker. Choose a screen by name or resolution. The picture and mouse coordinates
 follow the selected screen in the same connection. Input pauses until the first
-picture from that monitor is drawn.
+picture from that monitor is drawn. Right-click a different monitor in the
+list to open it in a separate window while the current tab keeps streaming.
 
 The other machine needs RustDesk's "Enable direct IP access" option; gliff
 does not use RustDesk's rendezvous servers or IDs. Its permanent password or

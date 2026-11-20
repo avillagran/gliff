@@ -38,6 +38,10 @@ impl State {
         changed
     }
 
+    pub fn expect_display(&mut self, index: i32) {
+        self.requested = Some(index);
+    }
+
     pub fn switching(&self) -> bool {
         self.requested.is_some()
     }
@@ -53,6 +57,9 @@ impl State {
 
 pub fn refresh(ui: &Rc<App>) {
     let button = &ui.rustdesk_display_button;
+    if ui.detached_display.is_some() {
+        return;
+    }
     let Some(session) = crate::active(ui) else {
         button.set_visible(false);
         return;
@@ -103,13 +110,29 @@ pub fn refresh(ui: &Rc<App>) {
         row.add_css_class("flat");
         row.set_sensitive(!selected);
         let index = display.index;
-        let ui = Rc::downgrade(ui);
-        let session = Rc::downgrade(&session);
+        let weak_ui = Rc::downgrade(ui);
+        let weak_session = Rc::downgrade(&session);
         row.connect_clicked(move |_| {
-            if let (Some(ui), Some(session)) = (ui.upgrade(), session.upgrade()) {
+            if let (Some(ui), Some(session)) = (weak_ui.upgrade(), weak_session.upgrade()) {
                 select(&ui, &session, index);
             }
         });
+        if !selected {
+            row.set_tooltip_text(Some("Right-click to open in a new window"));
+            let click = gtk::GestureClick::builder().button(3).build();
+            let weak_ui = Rc::downgrade(ui);
+            let weak_session = Rc::downgrade(&session);
+            click.connect_released(move |gesture, _, _, _| {
+                if let (Some(ui), Some(session)) = (weak_ui.upgrade(), weak_session.upgrade()) {
+                    if crate::is_active(&ui, &session) {
+                        gesture.set_state(gtk::EventSequenceState::Claimed);
+                        ui.rustdesk_display_button.popdown();
+                        crate::open_rustdesk_display_window(&ui, &session, index);
+                    }
+                }
+            });
+            row.add_controller(click);
+        }
         list.append(&row);
     }
     popover.set_child(Some(&list));

@@ -477,6 +477,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                 })),
             })))
             .await?;
+        // Returning to a display can resume an encoder that already has
+        // subscribers. Ask for a keyframe since we reset our decoder.
+        self.s
+            .send(&msg(Union::Misc(proto::Misc {
+                union: Some(proto::misc::Union::RefreshVideoDisplay(index)),
+            })))
+            .await?;
         self.pending_display = Some((screen, tokio::time::Instant::now() + DISPLAY_TIMEOUT));
         self.decoder = None;
         Ok(())
@@ -519,6 +526,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
                         });
                     }
                 }
+                proto::misc::Union::RefreshVideoDisplay(_) => {}
                 proto::misc::Union::CloseReason(why) => {
                     return Err(Error::other(format!("the other machine closed: {why}")));
                 }
