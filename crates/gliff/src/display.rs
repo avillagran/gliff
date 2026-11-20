@@ -36,7 +36,7 @@ pub struct Target {
 /// A running screen on another machine. Dropping it stops the screen.
 pub struct Display {
     ssh: Child,
-    server: Child,
+    server: Option<Child>,
     /// glib has reaped ssh, so its pid may already belong to another
     /// process and must not be signalled.
     ssh_reaped: bool,
@@ -115,7 +115,7 @@ impl Display {
         let pid = glib::Pid(ssh.id() as i32);
         let display = Rc::new(RefCell::new(Some(Display {
             ssh,
-            server,
+            server: Some(server),
             ssh_reaped: false,
         })));
         let watched = Rc::downgrade(&display);
@@ -125,7 +125,6 @@ impl Display {
             // glib reaped ssh; let the server finish its own cleanup.
             if let Some(mut d) = watched.upgrade().and_then(|d| d.borrow_mut().take()) {
                 d.ssh_reaped = true;
-                d.finish_server();
             }
             let why = failure(&host, status, &said.lock().unwrap());
             if let Some(ended) = ended.take() {
@@ -144,16 +143,19 @@ impl Display {
 
     /// The server ends when its stdin does; give it time to remove its
     /// output, then make sure it is gone.
-    fn finish_server(mut self) {
+    fn finish_server(&mut self) {
+        let Some(mut server) = self.server.take() else {
+            return;
+        };
         std::thread::spawn(move || {
             for _ in 0..50 {
-                if !matches!(self.server.try_wait(), Ok(None)) {
+                if !matches!(server.try_wait(), Ok(None)) {
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            let _ = self.server.kill();
-            let _ = self.server.wait();
+            let _ = server.kill();
+            let _ = server.wait();
         });
     }
 }
@@ -161,6 +163,7 @@ impl Display {
 impl Drop for Display {
     fn drop(&mut self) {
         self.stop();
+        self.finish_server();
     }
 }
 
