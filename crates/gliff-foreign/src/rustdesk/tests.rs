@@ -200,6 +200,7 @@ async fn logs_in_encrypted_and_drives_the_screen() -> anyhow::Result<()> {
         &credentials(PASSWORD),
         Purpose::Control,
         &mut rx,
+        None,
         &mut |e| seen.push(e),
     )
     .await;
@@ -235,6 +236,7 @@ async fn a_wrong_password_asks_again() -> anyhow::Result<()> {
         &credentials("nope"),
         Purpose::Control,
         &mut rx,
+        None,
         &mut |_| {},
     )
     .await;
@@ -272,6 +274,7 @@ async fn direct_ip_access_logs_in_without_a_key_exchange() {
         &credentials(PASSWORD),
         Purpose::Control,
         &mut rx,
+        None,
         &mut |_| {},
     )
     .await;
@@ -371,4 +374,129 @@ fn hex(b: &[u8]) -> String {
 fn every_login_to_a_machine_is_one_session() {
     assert_eq!(session_id(&target(21118)), session_id(&target(21118)));
     assert_ne!(session_id(&target(21118)), session_id(&target(21119)));
+}
+
+#[tokio::test]
+async fn switches_monitors_and_routes_input_to_the_decoded_picture() -> anyhow::Result<()> {
+    fn video(display: i32) -> Message {
+        msg(Union::VideoFrame(proto::VideoFrame {
+            display,
+            union: Some(proto::video_frame::Union::Vp9s(proto::EncodedVideoFrames {
+                frames: vec![proto::EncodedVideoFrame {
+                    data: include_bytes!("testdata/red-64x48.vp9").to_vec(),
+                    key: true,
+                    pts: 0,
+                }],
+            })),
+        }))
+    }
+    async fn expect_switch(s: &mut Stream<TcpStream>, index: i32) -> anyhow::Result<()> {
+        assert_eq!(
+            s.recv().await?.union,
+            Some(Union::Misc(proto::Misc {
+                union: Some(proto::misc::Union::SwitchDisplay(proto::SwitchDisplay {
+                    display: index,
+                    ..Default::default()
+                })),
+            }))
+        );
+        Ok(())
+    }
+    async fn expect_pointer(s: &mut Stream<TcpStream>, x: i32, y: i32) -> anyhow::Result<()> {
+        assert_eq!(
+            s.recv().await?.union,
+            Some(Union::MouseEvent(proto::MouseEvent {
+                mask: proto::MOUSE_TYPE_MOVE,
+                x,
+                y,
+                modifiers: vec![],
+            }))
+        );
+        Ok(())
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let (select, mut selection) = unbounded_channel();
+    let return_switch = select.clone();
+    let server = tokio::spawn(serve(listener, |mut s, _| async move {
+        let mut peer = peer_info();
+        peer.current_display = 9; // An unknown default falls back to the first screen and its index.
+        s.send(&msg(Union::LoginResponse(proto::LoginResponse {
+            union: Some(proto::login_response::Union::PeerInfo(peer)),
+        })))
+        .await?;
+        s.send(&video(0)).await?;
+        expect_switch(&mut s, 1).await?;
+        // The old stream can still have frames in flight.
+        s.send(&video(0)).await?;
+        s.send(&msg(Union::Misc(proto::Misc {
+            union: Some(proto::misc::Union::SwitchDisplay(proto::SwitchDisplay {
+                display: 1,
+                x: -64,
+                y: -48,
+                width: 64,
+                height: 48,
+            })),
+        })))
+        .await?;
+        s.send(&video(1)).await?;
+        expect_pointer(&mut s, -54, -28).await?;
+        return_switch.send(0)?;
+        expect_switch(&mut s, 0).await?;
+        s.send(&video(0)).await?;
+        expect_pointer(&mut s, 10, 20).await?;
+        Ok(())
+    }));
+
+    let (motion, mut input) = unbounded_channel();
+    let mut active = None;
+    let mut pictures = Vec::new();
+    let mut events = |event| match event {
+        Event::RustDeskDisplays {
+            displays,
+            active: index,
+            switch_failed,
+        } => {
+            assert!(!switch_failed);
+            assert_eq!(displays.len(), 2);
+            active = Some(index);
+        }
+        Event::Frame { .. } => {
+            pictures.push(active.unwrap());
+            match pictures.as_slice() {
+                [0] => select.send(1).unwrap(),
+                [0, 1] => motion
+                    .send(ClientMsg::PointerMotion { x: 10.0, y: 20.0 })
+                    .unwrap(),
+                [0, 1, 0] => motion
+                    .send(ClientMsg::PointerMotion { x: 10.0, y: 20.0 })
+                    .unwrap(),
+                other => panic!("Unexpected frame sequence {other:?}"),
+            }
+        }
+        Event::Resized { .. } | Event::Connected { .. } => {}
+        _ => panic!("Unexpected RustDesk event"),
+    };
+    let target = target(port);
+    let credentials = credentials(PASSWORD);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        run(
+            &target,
+            &credentials,
+            Purpose::View {
+                width: 64,
+                height: 48,
+            },
+            &mut input,
+            Some(&mut selection),
+            &mut events,
+        ),
+    )
+    .await?;
+    server.await??;
+    assert!(result.is_err(), "fixture closes the connection");
+    assert_eq!(pictures, [0, 1, 0]);
+    Ok(())
 }

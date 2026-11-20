@@ -237,9 +237,23 @@ pub struct Cursor {
     pub argb: Vec<u8>,
 }
 
+/// One monitor advertised by the RustDesk peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteDisplay {
+    pub index: i32,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// What a running session reports.
 #[derive(Debug)]
 pub enum Event {
+    RustDeskDisplays {
+        displays: Vec<RemoteDisplay>,
+        active: i32,
+        switch_failed: bool,
+    },
     /// Logged in: the screen is this many pixels.
     Connected {
         width: u32,
@@ -314,8 +328,20 @@ pub async fn run(
             )
             .await
         }
-        Kind::RustDesk => rustdesk::run(target, credentials, purpose, input, events).await,
+        Kind::RustDesk => rustdesk::run(target, credentials, purpose, input, None, events).await,
     }
+}
+
+/// View a RustDesk session with an optional in-session monitor change.
+pub async fn view_rustdesk(
+    target: &Target,
+    credentials: &Credentials,
+    purpose: Purpose,
+    input: &mut UnboundedReceiver<ClientMsg>,
+    displays: &mut UnboundedReceiver<i32>,
+    events: &mut dyn FnMut(Event),
+) -> Result<(), Error> {
+    rustdesk::run(target, credentials, purpose, input, Some(displays), events).await
 }
 
 /// What answers on `host`'s RDP and RustDesk ports, RDP first. Each answer

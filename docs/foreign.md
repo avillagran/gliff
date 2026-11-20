@@ -60,6 +60,11 @@ front of you.
 
 ## RustDesk
 
+When a RustDesk tab receives more than one monitor, its header shows a monitor
+picker. Choose a screen by name or resolution. The picture and mouse coordinates
+follow the selected screen in the same connection. Input pauses until the first
+picture from that monitor is drawn.
+
 The other machine needs RustDesk's "Enable direct IP access" option; gliff
 does not use RustDesk's rendezvous servers or IDs. Its permanent password or
 the one-time password it shows both work. RustDesk replaces a one-time

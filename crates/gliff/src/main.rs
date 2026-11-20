@@ -17,6 +17,7 @@ mod paintable;
 mod protocol_badge;
 mod recent;
 mod remote_install;
+mod rustdesk_displays;
 mod secrets;
 mod sound;
 mod theme;
@@ -120,6 +121,7 @@ struct App {
     /// What the picture shows: the latest frame fitted to the window.
     frame: paintable::FramePaintable,
     stats: gtk::Label,
+    rustdesk_display_button: gtk::MenuButton,
     /// Centred over the picture while the shown session is not streaming:
     /// connecting, reconnecting, an error, or no session at all.
     status: gtk::Label,
@@ -177,6 +179,7 @@ struct Session {
     name: String,
     endpoint: Endpoint,
     input_tx: RefCell<Option<OutSender>>,
+    rustdesk_displays: RefCell<rustdesk_displays::State>,
     /// Bumped by every `start_session` and by `stop_session`, so pollers and
     /// delayed reconnects of an earlier worker can tell they are stale.
     generation: Cell<u64>,
@@ -243,6 +246,7 @@ impl Session {
             name: machine_name(&endpoint).to_string(),
             endpoint,
             input_tx: RefCell::new(None),
+            rustdesk_displays: RefCell::new(Default::default()),
             generation: Cell::new(0),
             conn: Cell::new(0),
             retries: Cell::new(0),
@@ -488,6 +492,12 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     header.pack_start(&add_revealer);
     header.pack_end(&fullscreen_btn);
     header.pack_end(&stats_btn);
+    let rustdesk_display_button = gtk::MenuButton::builder()
+        .icon_name("video-display-symbolic")
+        .tooltip_text("Choose RustDesk monitor")
+        .visible(false)
+        .build();
+    header.pack_end(&rustdesk_display_button);
     let monitor_btn = gtk::Button::builder()
         .icon_name("video-display-symbolic")
         .build();
@@ -582,6 +592,7 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         video: video.clone(),
         frame,
         stats: stats.clone(),
+        rustdesk_display_button,
         status: status.clone(),
         hint,
         hint_generation: Cell::new(0),
@@ -1263,6 +1274,7 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
     // shown.
     request_resize(ui);
     request_zoom(ui);
+    rustdesk_displays::refresh(ui);
     refresh_tabs(ui);
 }
 
@@ -1276,6 +1288,7 @@ fn show_nothing(ui: &Rc<App>) {
     ui.stats.set_text("");
     ui.frame.clear();
     ui.video.set_cursor(None);
+    rustdesk_displays::refresh(ui);
     refresh_tabs(ui);
 }
 
@@ -1384,6 +1397,10 @@ fn set_stats(ui: &App, s: &Rc<Session>, text: &str) {
 
 /// Go back to a black screen with no stream geometry.
 fn show_disconnected(ui: &Rc<App>, s: &Rc<Session>) {
+    *s.rustdesk_displays.borrow_mut() = Default::default();
+    if is_active(ui, s) {
+        rustdesk_displays::refresh(ui);
+    }
     if s.connected.replace(false) {
         refresh_tabs(ui);
     }
@@ -1704,6 +1721,9 @@ fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u
             }
         }
         if let Some(p) = latest {
+            if !s.rustdesk_displays.borrow().accepts(p.rustdesk_display) {
+                return glib::ControlFlow::Continue;
+            }
             match frame_texture(p.frame) {
                 Ok(texture) => {
                     // Geometry follows the frame that really paints, so the
@@ -1717,6 +1737,12 @@ fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u
                             .set_frame(texture.clone(), device_scale(&ui), p.view);
                     }
                     *s.last_frame.borrow_mut() = Some((texture, p.view));
+                    if s.rustdesk_displays.borrow_mut().painted(p.rustdesk_display) {
+                        set_status(&ui, &s, "");
+                        if is_active(&ui, &s) {
+                            rustdesk_displays::refresh(&ui);
+                        }
+                    }
                 }
                 Err(e) => tracing::warn!(error = %e, "frame texture import failed"),
             }
@@ -1777,6 +1803,21 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
         }
         while let Ok(status) = rx.try_recv() {
             match status {
+                Status::RustDeskDisplays {
+                    displays,
+                    active,
+                    switch_failed,
+                } => {
+                    s.rustdesk_displays
+                        .borrow_mut()
+                        .update(displays, active, switch_failed);
+                    if switch_failed {
+                        set_status(&ui, &s, "RustDesk no longer offers that monitor");
+                    }
+                    if is_active(&ui, &s) {
+                        rustdesk_displays::refresh(&ui);
+                    }
+                }
                 // Pointer-mapping geometry (stream_size/view/scale) is not
                 // read from the config: it follows each decoded frame, so a
                 // new config never remaps clicks against the old picture.
@@ -1803,7 +1844,9 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     if !s.connected.replace(true) {
                         refresh_tabs(&ui);
                     }
-                    set_status(&ui, &s, "");
+                    if !s.rustdesk_displays.borrow().switching() {
+                        set_status(&ui, &s, "");
+                    }
                     // Visible before the first per-second stats arrive.
                     set_stats(&ui, &s, &video);
                     remember_machine(&ui, &s);
@@ -2062,6 +2105,17 @@ fn send(ui: &App, msg: ClientMsg) {
 }
 
 fn send_to(s: &Session, msg: ClientMsg) {
+    if s.rustdesk_displays.borrow().blocks_input()
+        && matches!(
+            msg,
+            ClientMsg::PointerMotion { .. }
+                | ClientMsg::PointerAxis { .. }
+                | ClientMsg::PointerButton { pressed: true, .. }
+                | ClientMsg::Key { pressed: true, .. }
+        )
+    {
+        return;
+    }
     if let Some(tx) = s.input_tx.borrow().as_ref() {
         let _ = tx.send(clipboard::ToWorker::Send(msg));
     }
@@ -2428,6 +2482,19 @@ fn install_input_handlers(
             if pressed {
                 ui.released.set(false);
                 video.grab_focus();
+                // A new monitor may have painted under a stationary pointer.
+                // Send its actual click position before the button down.
+                if active(&ui).is_some_and(|s| s.rustdesk_displays.borrow().has_display()) {
+                    if let Some((x, y)) = event.position() {
+                        if let Some(point) = ui
+                            .window
+                            .compute_point(&video, &gtk::graphene::Point::new(x as f32, y as f32))
+                        {
+                            let (x, y) = to_remote(&ui, f64::from(point.x()), f64::from(point.y()));
+                            send(&ui, ClientMsg::PointerMotion { x, y });
+                        }
+                    }
+                }
             }
             send(&ui, ClientMsg::PointerButton { button, pressed });
             glib::Propagation::Proceed
