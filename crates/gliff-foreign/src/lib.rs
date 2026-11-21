@@ -412,7 +412,24 @@ impl Scroll {
 pub(crate) async fn reach(target: &Target) -> Result<TcpStream, Error> {
     let address = target.address();
     match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&address)).await {
-        Ok(Ok(stream)) => Ok(stream),
+        Ok(Ok(stream)) => {
+            // Foreign servers can be idle on a healthy connection. Let TCP
+            // probe the link and bound unacknowledged writes instead of
+            // treating an idle desktop as a disconnect.
+            let socket = socket2::SockRef::from(&stream);
+            socket
+                .set_tcp_keepalive(
+                    &socket2::TcpKeepalive::new()
+                        .with_time(Duration::from_secs(4))
+                        .with_interval(Duration::from_secs(2))
+                        .with_retries(3),
+                )
+                .map_err(|e| Error::other(format!("configure TCP keepalive for {address}: {e}")))?;
+            socket
+                .set_tcp_user_timeout(Some(Duration::from_secs(10)))
+                .map_err(|e| Error::other(format!("configure TCP timeout for {address}: {e}")))?;
+            Ok(stream)
+        }
         Ok(Err(e)) => Err(Error::other(format!("connect to {address}: {e}"))),
         Err(_) => Err(Error::other(format!(
             "{address} did not answer within {}s; is the {} server running and the port open?",
@@ -476,6 +493,28 @@ async fn probe_one(host: &str, kind: Kind) -> Option<Kind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreign_connections_configure_bounded_tcp_failure_detection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::parse(&format!("rustdesk://{}", listener.local_addr().unwrap()))
+            .unwrap()
+            .unwrap();
+        let stream = reach(&target).await.unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        let socket = socket2::SockRef::from(&stream);
+        assert!(socket.keepalive().unwrap());
+        assert_eq!(socket.tcp_keepalive_time().unwrap(), Duration::from_secs(4));
+        assert_eq!(
+            socket.tcp_keepalive_interval().unwrap(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(socket.tcp_keepalive_retries().unwrap(), 3);
+        assert_eq!(
+            socket.tcp_user_timeout().unwrap(),
+            Some(Duration::from_secs(10))
+        );
+    }
 
     #[tokio::test]
     async fn a_login_stops_with_its_tab_or_its_deadline() {

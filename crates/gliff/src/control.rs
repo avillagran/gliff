@@ -357,7 +357,13 @@ impl Shared {
         {
             if !mime_types.is_empty() || !files.is_empty() {
                 self.holder.set(Some(side));
-                *self.selection.borrow_mut() = None;
+                if self.selection.borrow_mut().take().is_some() {
+                    for bridge in self.bridges.borrow().values() {
+                        bridge.on_compositor_event(ClipboardEvent::Selection {
+                            mime_types: Vec::new(),
+                        });
+                    }
+                }
             } else if self.holder.get() != Some(side) {
                 // That machine's clipboard emptied; ours is not its copy.
                 return;
@@ -633,6 +639,23 @@ impl Controller {
             }
             EdgeEvent::Entered { side, along } => self.enter(side, along),
             EdgeEvent::Motion { dx, dy } => self.motion(dx, dy),
+            EdgeEvent::HeldKeys(codes) => {
+                for code in codes {
+                    let Some(active) = self.active.as_mut() else {
+                        break;
+                    };
+                    if active.keys.insert(code) {
+                        let side = active.side;
+                        self.send(
+                            side,
+                            ClientMsg::Key {
+                                keycode: code,
+                                pressed: true,
+                            },
+                        );
+                    }
+                }
+            }
             EdgeEvent::Key { code, pressed } => {
                 let hotkey = pressed
                     && self
@@ -1119,7 +1142,9 @@ async fn session(
                                         *data_len as usize <= CHUNK,
                                         "clipboard chunk of {data_len} bytes exceeds the limit"
                                     );
-                                    reader.read_payload(*data_len).await?
+                                    tokio::time::timeout(SILENCE, reader.read_payload(*data_len))
+                                        .await
+                                        .context("timed out reading the remote clipboard")??
                                 }
                                 _ => Bytes::new(),
                             };
@@ -1181,6 +1206,36 @@ mod tests {
             mime_types: mime.iter().map(|m| m.to_string()).collect(),
             files: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn remote_copy_withdraws_all_local_bridge_offers() {
+        tokio::task::LocalSet::new().run_until(async {
+            let shared = Shared::default();
+            let mut peers = Vec::new();
+            for side in [Side::Left, Side::Right] {
+                let (tx, rx) = outbound_channel();
+                shared.connected(side, Rc::new(Bridge::new(
+                    Transfers::new(tx, clipboard::Side::Client),
+                    Jobs::new(|_, _| {}),
+                    None,
+                )));
+                peers.push(rx);
+            }
+            shared.on_compositor(ClipboardEvent::Selection {
+                mime_types: vec!["text/plain".into()],
+            });
+            let wait = Duration::from_secs(1);
+            for peer in &mut peers {
+                let (message, _) = tokio::time::timeout(wait, peer.recv()).await.unwrap().unwrap();
+                assert!(matches!(message, ClipboardMsg::Offer { mime_types, .. } if !mime_types.is_empty()));
+            }
+            shared.on_peer(Side::Left, offer(&["text/plain"]), Bytes::new());
+            for peer in &mut peers {
+                let (message, _) = tokio::time::timeout(wait, peer.recv()).await.unwrap().unwrap();
+                assert!(matches!(message, ClipboardMsg::Offer { mime_types, files, .. } if mime_types.is_empty() && files.is_empty()));
+            }
+        }).await;
     }
 
     #[test]

@@ -4,12 +4,13 @@ description = "Show and drive machines that run an RDP server or RustDesk instea
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-rust-version = "1.94"
+rust-version.workspace = true
 
 [lints]
 workspace = true
 
 [dependencies]
+socket2 = { version = "0.6", features = ["all"] }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

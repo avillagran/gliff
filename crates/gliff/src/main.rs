@@ -1543,6 +1543,9 @@ fn show_nothing(ui: &Rc<App>) {
 /// End a machine's session. When it was the one shown, the window moves to
 /// the nearest running tab, to the right first.
 fn stop_session(ui: &Rc<App>, name: &str) {
+    if let Some(controller) = ui.monitor.borrow().as_ref() {
+        controller.cancel_check(name);
+    }
     let Some(s) = find_session(ui, name) else {
         return;
     };
@@ -1585,6 +1588,9 @@ fn stop_session(ui: &Rc<App>, name: &str) {
 
 /// Drop a machine that is not running from the remembered list.
 fn forget_machine(ui: &Rc<App>, name: &str) {
+    if let Some(controller) = ui.monitor.borrow().as_ref() {
+        controller.cancel_check(name);
+    }
     update_config(ui, |c| c.forget(name));
     if gliff_foreign::Target::parse(name).is_some() {
         foreign_ui::forget(name);
