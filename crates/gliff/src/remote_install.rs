@@ -23,8 +23,6 @@ const SCRIPT: &str = include_str!("remote_install.py");
 const TIMEOUT: Duration = Duration::from_secs(180);
 /// Asking a machine what its gliff-server can do.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Where gliff-server is uploaded to, in the remote home, for the script.
-const UPLOAD: &str = "~/.local/bin/.gliff-server.upload";
 /// Where the script puts gliff-server, as a command for the remote shell:
 /// the one to run when another comes first on that machine's PATH.
 pub const USER_SERVER: &str = "~/.local/bin/gliff-server";
@@ -132,10 +130,14 @@ pub async fn update_server(host: &str) -> Outcome {
         Ok(meta) => meta.len().to_string(),
         Err(e) => return Outcome::Failed(format!("Cannot read {}: {e}", server.display())),
     };
-    let command = format!("mkdir -p ~/.local/bin && cat > {UPLOAD}");
-    let argv = ssh_argv(host, &[], &[&command]);
+    // The same remote process receives, validates and adopts the binary.
+    // Quote the embedded program as one argument to the remote shell.
+    let script = format!("'{}'", SCRIPT.replace('\'', "'\\''"));
+    let argv = ssh_argv(host, &[], &["python3", "-I", "-c", &script, &size]);
     let argv: Vec<&std::ffi::OsStr> = argv.iter().map(|a| a.as_ref()).collect();
-    let launcher = gio::SubprocessLauncher::new(gio::SubprocessFlags::STDERR_PIPE);
+    let launcher = gio::SubprocessLauncher::new(
+        gio::SubprocessFlags::STDOUT_PIPE | gio::SubprocessFlags::STDERR_PIPE,
+    );
     launcher.set_stdin_file_path(Some(&server));
     let process = match launcher.spawn(&argv) {
         Ok(p) => p,
@@ -143,19 +145,16 @@ pub async fn update_server(host: &str) -> Outcome {
     };
     let output = glib::future_with_timeout(TIMEOUT, process.communicate_utf8_future(None)).await;
     match output {
-        Ok(Ok((_, stderr))) if !process.is_successful() => {
-            let stderr = stderr.as_deref().unwrap_or("");
-            let why = stderr.lines().rev().find(|l| !l.trim().is_empty());
-            return Outcome::Failed(why.unwrap_or("The upload failed").trim().to_string());
-        }
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Outcome::Failed(format!("ssh failed: {e}")),
+        Ok(Ok((stdout, stderr))) => outcome(
+            stdout.as_deref().unwrap_or(""),
+            stderr.as_deref().unwrap_or(""),
+        ),
+        Ok(Err(e)) => Outcome::Failed(format!("ssh failed: {e}")),
         Err(_) => {
             process.force_exit();
-            return Outcome::Failed("The upload timed out".into());
+            Outcome::Failed("The upload timed out".into())
         }
     }
-    run_script(host, &[], &[&size]).await
 }
 
 /// What `uname -m` says on `host`.
@@ -312,8 +311,6 @@ mod tests {
     ) -> Outcome {
         let bin = home.join(".local/bin");
         std::fs::create_dir_all(&bin).unwrap();
-        let uploaded = bin.join(".gliff-server.upload");
-        std::fs::write(&uploaded, upload).unwrap();
         let dirs = first.iter().map(|p| p.to_path_buf());
         let path = std::env::join_paths(dirs.chain(with_bin.then_some(bin))).unwrap();
         // Found before PATH is narrowed to the test's directories.
@@ -322,7 +319,7 @@ mod tests {
             .find(|p| p.is_file())
             .expect("python3 on PATH");
         let mut python = Command::new(python)
-            .args(["-I", "-", &upload.len().to_string()])
+            .args(["-I", "-c", SCRIPT, &upload.len().to_string()])
             .env("HOME", home)
             .env("PATH", path)
             .stdin(Stdio::piped())
@@ -333,10 +330,21 @@ mod tests {
             .stdin
             .take()
             .unwrap()
-            .write_all(SCRIPT.as_bytes())
+            .write_all(upload.as_bytes())
             .unwrap();
         let output = python.wait_with_output().unwrap();
-        assert!(!uploaded.exists(), "the upload is cleaned up");
+        assert!(
+            std::fs::read_dir(home.join(".local/bin"))
+                .unwrap()
+                .all(|entry| {
+                    !entry
+                        .unwrap()
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".gliff-upload-")
+                }),
+            "the upload is cleaned up"
+        );
         outcome(&String::from_utf8_lossy(&output.stdout), "")
     }
 
