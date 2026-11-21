@@ -639,6 +639,23 @@ impl Controller {
             }
             EdgeEvent::Entered { side, along } => self.enter(side, along),
             EdgeEvent::Motion { dx, dy } => self.motion(dx, dy),
+            EdgeEvent::HeldKeys(codes) => {
+                for code in codes {
+                    let Some(active) = self.active.as_mut() else {
+                        break;
+                    };
+                    if active.keys.insert(code) {
+                        let side = active.side;
+                        self.send(
+                            side,
+                            ClientMsg::Key {
+                                keycode: code,
+                                pressed: true,
+                            },
+                        );
+                    }
+                }
+            }
             EdgeEvent::Key { code, pressed } => {
                 let hotkey = pressed
                     && self
