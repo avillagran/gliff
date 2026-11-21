@@ -4,7 +4,7 @@
 //! edge ([`control`](crate::control)), and stop either again.
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -101,7 +101,7 @@ pub struct Controller {
     driven: RefCell<BTreeMap<String, Driven>>,
     next_id: Cell<u64>,
     /// Machines being checked, or updated, before they are driven.
-    checking: RefCell<BTreeSet<String>>,
+    checking: RefCell<BTreeMap<String, u64>>,
     hide_button: gtk::Button,
     /// The tray icon, while the window is hidden in it.
     tray: RefCell<Option<Tray>>,
@@ -195,6 +195,7 @@ impl Controller {
         let weak = Rc::downgrade(&this);
         ui.window.connect_close_request(move |_| {
             if let Some(c) = weak.upgrade() {
+                c.checking.borrow_mut().clear();
                 c.stop();
                 // Joined here, so each pointer is back before the app goes.
                 c.driven.borrow_mut().clear();
@@ -647,16 +648,21 @@ impl Controller {
     /// Drive `name`, once its gliff-server can be, offering to update it
     /// when it is too old: left to fail, it would only retry for ever.
     fn start_control(self: &Rc<Self>, name: String, settings: &Settings) {
-        if self.control_refused(&name, settings) || !self.checking.borrow_mut().insert(name.clone())
-        {
+        if self.control_refused(&name, settings) || self.checking.borrow().contains_key(&name) {
             return;
         }
+        let attempt = self.next_id.get() + 1;
+        self.next_id.set(attempt);
+        self.checking.borrow_mut().insert(name.clone(), attempt);
         self.note(&format!("Checking {name}…"));
         let settings = settings.clone();
         let c = self.clone();
         glib::spawn_future_local(async move {
-            let server_bin = c.server_for(&name).await;
-            c.checking.borrow_mut().remove(&name);
+            let server_bin = c.server_for(&name, attempt).await;
+            if !c.check_is_current(&name, attempt) {
+                return;
+            }
+            c.cancel_check(&name);
             if let Some(server_bin) = server_bin {
                 if !c.control_refused(&name, &settings) {
                     c.drive(name, &settings, server_bin);
@@ -668,13 +674,20 @@ impl Controller {
     /// The gliff-server to drive `name` with, after updating it if the user
     /// agrees; `None` when it cannot be driven. A machine that does not
     /// answer counts: connecting says why it failed.
-    async fn server_for(&self, name: &str) -> Option<String> {
+    async fn server_for(&self, name: &str, attempt: u64) -> Option<String> {
         let ui = self.ui.upgrade()?;
         let server_bin = ui.cli.server_bin.clone();
         if let Some(found) = self.server_that_controls(name, &server_bin).await {
             return Some(found);
         }
-        if !remote_install::confirm_update(&ui.window, name).await {
+        if !self.check_is_current(name, attempt) {
+            return None;
+        }
+        let confirmed = remote_install::confirm_update(&ui.window, name).await;
+        if !self.check_is_current(name, attempt) {
+            return None;
+        }
+        if !confirmed {
             self.note(&format!(
                 "{name} needs a newer gliff-server to be controlled."
             ));
@@ -818,7 +831,16 @@ impl Controller {
 
     /// Stop driving `name`. Its thread gives the pointer back and is joined
     /// off the main loop.
+    fn check_is_current(&self, name: &str, attempt: u64) -> bool {
+        self.checking.borrow().get(name) == Some(&attempt)
+    }
+
+    pub fn cancel_check(&self, name: &str) {
+        self.checking.borrow_mut().remove(name);
+    }
+
     pub fn stop_control(&self, name: &str) {
+        self.cancel_check(name);
         let Some(mut driven) = self.driven.borrow_mut().remove(name) else {
             return;
         };

@@ -105,6 +105,8 @@ pub enum EdgeEvent {
         dx: f64,
         dy: f64,
     },
+    /// Keys already down when the captured surface gets keyboard focus.
+    HeldKeys(Vec<u32>),
     /// An evdev key code.
     Key {
         code: u32,
