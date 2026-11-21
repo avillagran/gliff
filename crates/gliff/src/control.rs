@@ -332,7 +332,13 @@ impl Shared {
         {
             if !mime_types.is_empty() || !files.is_empty() {
                 self.holder.set(Some(side));
-                *self.selection.borrow_mut() = None;
+                if self.selection.borrow_mut().take().is_some() {
+                    for bridge in self.bridges.borrow().values() {
+                        bridge.on_compositor_event(ClipboardEvent::Selection {
+                            mime_types: Vec::new(),
+                        });
+                    }
+                }
             } else if self.holder.get() != Some(side) {
                 // That machine's clipboard emptied; ours is not its copy.
                 return;
@@ -948,7 +954,9 @@ async fn session(
                                         *data_len as usize <= CHUNK,
                                         "clipboard chunk of {data_len} bytes exceeds the limit"
                                     );
-                                    reader.read_payload(*data_len).await?
+                                    tokio::time::timeout(SILENCE, reader.read_payload(*data_len))
+                                        .await
+                                        .context("timed out reading the remote clipboard")??
                                 }
                                 _ => Bytes::new(),
                             };
