@@ -1549,6 +1549,7 @@ dependencies = [
  "prost",
  "rand_core 0.6.4",
  "sha2 0.10.9",
+ "socket2",
  "thiserror",
  "tokio",
  "tracing",

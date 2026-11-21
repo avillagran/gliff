@@ -613,7 +613,18 @@ impl Dispatch<WlKeyboard, ()> for State {
                 locked: mods_locked,
                 group,
             }),
-            wl_keyboard::Event::Enter { .. } => tracing::debug!("keyboard focus here"),
+            wl_keyboard::Event::Enter { surface, keys, .. }
+                if state
+                    .capture
+                    .as_ref()
+                    .is_some_and(|capture| state.edge_of(&surface) == Some(capture.edge)) =>
+            {
+                state.emit(EdgeEvent::HeldKeys(
+                    keys.chunks_exact(4)
+                        .map(|code| u32::from_ne_bytes(code.try_into().expect("four bytes")))
+                        .collect(),
+                ));
+            }
             wl_keyboard::Event::Leave { .. } => tracing::debug!("keyboard focus gone"),
             wl_keyboard::Event::Key {
                 key,

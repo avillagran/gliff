@@ -295,7 +295,7 @@ pub struct TestDelay {
 
 #[derive(Clone, PartialEq, prost::Message)]
 pub struct Misc {
-    #[prost(oneof = "misc::Union", tags = "5, 9")]
+    #[prost(oneof = "misc::Union", tags = "5, 9, 31")]
     pub union: Option<misc::Union>,
 }
 
@@ -306,6 +306,8 @@ pub mod misc {
         SwitchDisplay(super::SwitchDisplay),
         #[prost(string, tag = "9")]
         CloseReason(String),
+        #[prost(int32, tag = "31")]
+        RefreshVideoDisplay(i32),
     }
 }
 

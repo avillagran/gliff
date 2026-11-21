@@ -237,9 +237,23 @@ pub struct Cursor {
     pub argb: Vec<u8>,
 }
 
+/// One monitor advertised by the RustDesk peer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RemoteDisplay {
+    pub index: i32,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+}
+
 /// What a running session reports.
 #[derive(Debug)]
 pub enum Event {
+    RustDeskDisplays {
+        displays: Vec<RemoteDisplay>,
+        active: i32,
+        switch_failed: bool,
+    },
     /// Logged in: the screen is this many pixels.
     Connected {
         width: u32,
@@ -314,8 +328,20 @@ pub async fn run(
             )
             .await
         }
-        Kind::RustDesk => rustdesk::run(target, credentials, purpose, input, events).await,
+        Kind::RustDesk => rustdesk::run(target, credentials, purpose, input, None, events).await,
     }
+}
+
+/// View a RustDesk session with an optional in-session monitor change.
+pub async fn view_rustdesk(
+    target: &Target,
+    credentials: &Credentials,
+    purpose: Purpose,
+    input: &mut UnboundedReceiver<ClientMsg>,
+    displays: &mut UnboundedReceiver<i32>,
+    events: &mut dyn FnMut(Event),
+) -> Result<(), Error> {
+    rustdesk::run(target, credentials, purpose, input, Some(displays), events).await
 }
 
 /// What answers on `host`'s RDP and RustDesk ports, RDP first. Each answer
@@ -371,7 +397,24 @@ impl Scroll {
 pub(crate) async fn reach(target: &Target) -> Result<TcpStream, Error> {
     let address = target.address();
     match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&address)).await {
-        Ok(Ok(stream)) => Ok(stream),
+        Ok(Ok(stream)) => {
+            // Foreign servers can be idle on a healthy connection. Let TCP
+            // probe the link and bound unacknowledged writes instead of
+            // treating an idle desktop as a disconnect.
+            let socket = socket2::SockRef::from(&stream);
+            socket
+                .set_tcp_keepalive(
+                    &socket2::TcpKeepalive::new()
+                        .with_time(Duration::from_secs(4))
+                        .with_interval(Duration::from_secs(2))
+                        .with_retries(3),
+                )
+                .map_err(|e| Error::other(format!("configure TCP keepalive for {address}: {e}")))?;
+            socket
+                .set_tcp_user_timeout(Some(Duration::from_secs(10)))
+                .map_err(|e| Error::other(format!("configure TCP timeout for {address}: {e}")))?;
+            Ok(stream)
+        }
         Ok(Err(e)) => Err(Error::other(format!("connect to {address}: {e}"))),
         Err(_) => Err(Error::other(format!(
             "{address} did not answer within {}s; is the {} server running and the port open?",
@@ -435,6 +478,28 @@ async fn probe_one(host: &str, kind: Kind) -> Option<Kind> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn foreign_connections_configure_bounded_tcp_failure_detection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = Target::parse(&format!("rustdesk://{}", listener.local_addr().unwrap()))
+            .unwrap()
+            .unwrap();
+        let stream = reach(&target).await.unwrap();
+        let (_peer, _) = listener.accept().await.unwrap();
+        let socket = socket2::SockRef::from(&stream);
+        assert!(socket.keepalive().unwrap());
+        assert_eq!(socket.tcp_keepalive_time().unwrap(), Duration::from_secs(4));
+        assert_eq!(
+            socket.tcp_keepalive_interval().unwrap(),
+            Duration::from_secs(2)
+        );
+        assert_eq!(socket.tcp_keepalive_retries().unwrap(), 3);
+        assert_eq!(
+            socket.tcp_user_timeout().unwrap(),
+            Some(Duration::from_secs(10))
+        );
+    }
 
     #[tokio::test]
     async fn a_login_stops_with_its_tab_or_its_deadline() {

@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use crate::{keys, Credentials, Error, Event, Purpose, Scroll, Target};
+use crate::{keys, Credentials, Error, Event, Purpose, RemoteDisplay, Scroll, Target};
 
 pub mod proto;
 pub mod stream;
@@ -40,6 +40,7 @@ const CLIENT_VERSION: &str = "1.4.0";
 /// Frames a second asked for while only driving from the edge, where no
 /// picture is shown.
 const CONTROL_FPS: i32 = 1;
+const DISPLAY_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Whether `stream` opens like a RustDesk server: its identity, or the
 /// login challenge of one that skips encryption.
@@ -132,6 +133,7 @@ pub(crate) async fn run(
     credentials: &Credentials,
     purpose: Purpose,
     input: &mut UnboundedReceiver<ClientMsg>,
+    displays: Option<&mut UnboundedReceiver<i32>>,
     events: &mut dyn FnMut(Event),
 ) -> Result<(), Error> {
     let io = crate::reach(target).await?;
@@ -147,7 +149,9 @@ pub(crate) async fn run(
     let Some(peer) = crate::set_up(target, LOGIN_TIMEOUT, input, login).await? else {
         return Ok(());
     };
-    Session::new(s, peer, purpose)?.run(input, events).await
+    Session::new(s, peer, purpose)?
+        .run(input, displays, events)
+        .await
 }
 
 async fn login<S: AsyncRead + AsyncWrite + Unpin>(
@@ -328,10 +332,23 @@ struct Screen {
     height: u32,
 }
 
+fn screen_at(displays: &[proto::DisplayInfo], index: i32) -> Option<Screen> {
+    let d = displays.get(usize::try_from(index).ok()?)?;
+    (d.width > 0 && d.height > 0).then_some(Screen {
+        index,
+        x: d.x,
+        y: d.y,
+        width: d.width as u32,
+        height: d.height as u32,
+    })
+}
+
 struct Session<S> {
     s: Stream<S>,
     platform: Platform,
     screen: Screen,
+    displays: Vec<proto::DisplayInfo>,
+    pending_display: Option<(Screen, tokio::time::Instant)>,
     view: bool,
     decoder: Option<vpx::Decoder>,
     scroll: Scroll,
@@ -343,11 +360,8 @@ struct Session<S> {
 
 impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     fn new(s: Stream<S>, peer: proto::PeerInfo, purpose: Purpose) -> Result<Self, Error> {
-        let index = peer.current_display;
-        let d = usize::try_from(index)
-            .ok()
-            .and_then(|i| peer.displays.get(i))
-            .or_else(|| peer.displays.first())
+        let screen = screen_at(&peer.displays, peer.current_display)
+            .or_else(|| screen_at(&peer.displays, 0))
             .ok_or_else(|| Error::other("the other machine named no screen"))?;
         tracing::info!(
             platform = %peer.platform,
@@ -358,24 +372,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         Ok(Self {
             s,
             platform: Platform::of(&peer.platform),
-            screen: Screen {
-                index,
-                x: d.x,
-                y: d.y,
-                width: d.width.max(1) as u32,
-                height: d.height.max(1) as u32,
-            },
+            screen,
+            displays: peer.displays,
+            pending_display: None,
             view: matches!(purpose, Purpose::View { .. }),
             decoder: None,
             scroll: Scroll::default(),
             locks: Vec::new(),
-            pointer: (d.x, d.y),
+            pointer: (screen.x, screen.y),
         })
     }
 
     async fn run(
         mut self,
         input: &mut UnboundedReceiver<ClientMsg>,
+        mut displays: Option<&mut UnboundedReceiver<i32>>,
         events: &mut dyn FnMut(Event),
     ) -> Result<(), Error> {
         events(Event::Connected {
@@ -383,37 +394,139 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             height: self.screen.height,
             video: "RustDesk".into(),
         });
+        self.report_displays(events, false);
         loop {
+            let deadline = self.pending_display.map(|(_, deadline)| deadline);
             tokio::select! {
                 m = self.s.recv() => self.on_message(m?, events).await?,
                 m = input.recv() => match m {
                     Some(m) => self.on_input(m).await?,
                     None => return Ok(()),
                 },
+                selected = async {
+                    match displays.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(index) = selected {
+                        self.request_display(index, events).await?;
+                    } else {
+                        displays = None;
+                    }
+                },
+                () = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // The peer may already have switched capture. Never resume
+                    // sending pointer coordinates for the old picture.
+                    return Err(Error::other("RustDesk did not send a picture of the selected monitor"));
+                }
             }
         }
+    }
+
+    fn report_displays(&self, events: &mut dyn FnMut(Event), switch_failed: bool) {
+        if self.view {
+            events(Event::RustDeskDisplays {
+                displays: self
+                    .displays
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, d)| {
+                        let index = i32::try_from(i).ok()?;
+                        let screen = screen_at(&self.displays, index)?;
+                        Some(RemoteDisplay {
+                            index,
+                            name: d.name.clone(),
+                            width: screen.width,
+                            height: screen.height,
+                        })
+                    })
+                    .collect(),
+                active: self.screen.index,
+                switch_failed,
+            });
+        }
+    }
+
+    async fn request_display(
+        &mut self,
+        index: i32,
+        events: &mut dyn FnMut(Event),
+    ) -> Result<(), Error> {
+        if self.pending_display.is_some() {
+            return Ok(());
+        }
+        if index == self.screen.index {
+            self.report_displays(events, false);
+            return Ok(());
+        }
+        let Some(screen) = screen_at(&self.displays, index) else {
+            self.report_displays(events, true);
+            return Ok(());
+        };
+        self.s
+            .send(&msg(Union::Misc(proto::Misc {
+                union: Some(proto::misc::Union::SwitchDisplay(proto::SwitchDisplay {
+                    display: index,
+                    ..Default::default()
+                })),
+            })))
+            .await?;
+        // Returning to a display can resume an encoder that already has
+        // subscribers. Ask for a keyframe since we reset our decoder.
+        self.s
+            .send(&msg(Union::Misc(proto::Misc {
+                union: Some(proto::misc::Union::RefreshVideoDisplay(index)),
+            })))
+            .await?;
+        self.pending_display = Some((screen, tokio::time::Instant::now() + DISPLAY_TIMEOUT));
+        self.decoder = None;
+        Ok(())
     }
 
     async fn on_message(&mut self, m: Message, events: &mut dyn FnMut(Event)) -> Result<(), Error> {
         match m.union {
             Some(Union::VideoFrame(f)) if self.view => self.on_video(f, events)?,
+            Some(Union::PeerInfo(info)) if self.view && !info.displays.is_empty() => {
+                if self.displays != info.displays {
+                    self.displays = info.displays;
+                    self.report_displays(events, false);
+                }
+            }
             Some(Union::TestDelay(t)) if !t.from_client => {
                 self.s.send(&msg(Union::TestDelay(t))).await?;
             }
             Some(Union::Misc(proto::Misc { union: Some(u) })) => match u {
                 proto::misc::Union::SwitchDisplay(d) => {
-                    self.screen = Screen {
+                    let screen = Screen {
                         index: d.display,
                         x: d.x,
                         y: d.y,
                         width: d.width.max(1) as u32,
                         height: d.height.max(1) as u32,
                     };
-                    events(Event::Resized {
-                        width: self.screen.width,
-                        height: self.screen.height,
-                    });
+                    if let Some((pending, _)) = self.pending_display.as_mut() {
+                        if pending.index == screen.index {
+                            *pending = screen;
+                        }
+                    } else if self.view && self.screen.index != screen.index {
+                        self.pending_display =
+                            Some((screen, tokio::time::Instant::now() + DISPLAY_TIMEOUT));
+                        self.decoder = None;
+                    } else {
+                        self.screen = screen;
+                        events(Event::Resized {
+                            width: screen.width,
+                            height: screen.height,
+                        });
+                    }
                 }
+                proto::misc::Union::RefreshVideoDisplay(_) => {}
                 proto::misc::Union::CloseReason(why) => {
                     return Err(Error::other(format!("the other machine closed: {why}")));
                 }
@@ -429,7 +542,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
         events: &mut dyn FnMut(Event),
     ) -> Result<(), Error> {
         use proto::video_frame::Union as V;
-        if f.display != self.screen.index {
+        let expected = self
+            .pending_display
+            .map_or(self.screen, |(screen, _)| screen);
+        if f.display != expected.index {
             return Ok(());
         }
         let (codec, frames) = match f.union {
@@ -457,6 +573,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
             }
         }
         if let Some(p) = newest {
+            if let Some((screen, _)) = self.pending_display.take() {
+                self.screen = screen;
+                self.pointer = (screen.x, screen.y);
+                self.report_displays(events, false);
+            }
             if (p.width, p.height) != (self.screen.width, self.screen.height) {
                 self.screen.width = p.width;
                 self.screen.height = p.height;
@@ -487,11 +608,29 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Session<S> {
     }
 
     async fn on_input(&mut self, m: ClientMsg) -> Result<(), Error> {
+        // Release events still need to reach the peer during a switch.
+        if self.pending_display.is_some()
+            && matches!(
+                m,
+                ClientMsg::PointerMotion { .. }
+                    | ClientMsg::PointerAxis { .. }
+                    | ClientMsg::PointerButton { pressed: true, .. }
+                    | ClientMsg::Key { pressed: true, .. }
+            )
+        {
+            return Ok(());
+        }
         match m {
             ClientMsg::PointerMotion { x, y } => {
                 let max = |len: u32| f64::from(len.saturating_sub(1));
-                let px = self.screen.x + x.round().clamp(0.0, max(self.screen.width)) as i32;
-                let py = self.screen.y + y.round().clamp(0.0, max(self.screen.height)) as i32;
+                let px = self
+                    .screen
+                    .x
+                    .saturating_add(x.round().clamp(0.0, max(self.screen.width)) as i32);
+                let py = self
+                    .screen
+                    .y
+                    .saturating_add(y.round().clamp(0.0, max(self.screen.height)) as i32);
                 self.pointer = (px, py);
                 self.mouse(proto::MOUSE_TYPE_MOVE, px, py).await?;
             }

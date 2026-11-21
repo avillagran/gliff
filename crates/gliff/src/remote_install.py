@@ -6,10 +6,10 @@ back. It downloads the gliff package from the Omarchy repository configured in
 own pacman keyring, and copies the binaries to ~/.local. Nothing runs as root
 and nothing outside the user's home changes; the download is deleted.
 
-Given a size as its argument it instead puts in place a gliff-server of that
-size the client has just uploaded, for a machine whose server is too old.
+With a size argument, it instead reads a gliff-server binary from stdin.
 """
 
+import fcntl
 import hashlib
 import json
 import os
@@ -17,6 +17,7 @@ import pathlib
 import platform
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -38,8 +39,6 @@ FILES = {
 }
 BINARIES = ["usr/bin/gliff", "usr/bin/gliff-server"]
 SERVER = FILES["usr/bin/gliff-server"]
-# Where the client uploads its own gliff-server for `adopt`.
-UPLOAD = HOME / ".local/bin/.gliff-server.upload"
 
 
 class Refused(Exception):
@@ -234,14 +233,14 @@ def install(staged, version):
     write_manifest(manifest)
 
 
-def check_upload(size):
+def check_upload(upload, size):
     """The version of the uploaded gliff-server, once it has proved it runs here."""
-    if UPLOAD.stat().st_size != size:
+    if upload.stat().st_size != size:
         raise Refused("upload", "The upload did not finish")
-    os.chmod(UPLOAD, 0o755)
+    os.chmod(upload, 0o755)
     try:
-        help_text = run([str(UPLOAD), "--help"])
-        version = run([str(UPLOAD), "--version"]).stdout.split()
+        help_text = run([str(upload), "--help"])
+        version = run([str(upload), "--version"]).stdout.split()
     except OSError as e:
         raise Refused("incompatible", f"This gliff-server does not run on that machine: {e.strerror}") from None
     if help_text.returncode or "--control" not in help_text.stdout:
@@ -255,31 +254,63 @@ def adopt(size):
 
     Like `install` it replaces only gliff's own file, and the upload has to
     run here first, so a failure leaves the working server in place."""
-    try:
-        version = check_upload(size)
-        manifest = read_manifest()
-        target = HOME / SERVER
-        if os.path.lexists(target):
-            meta = target.lstat()
-            ours = (stat.S_ISREG(meta.st_mode) and meta.st_uid == os.getuid()
-                    and digest(target) in owned_hashes(manifest, SERVER))
-            if not ours:
-                raise Refused("conflict", f"~/{SERVER} already exists and was not installed by gliff")
-        data = UPLOAD.read_bytes()
-        files = dict(manifest.get("files", {}))
-        pending = {SERVER: hashlib.sha256(data).hexdigest()}
-        write_manifest({"version": version, "complete": False, "files": files, "pending": pending})
-        write_atomic(target, data, 0o755)
-        files[SERVER] = pending[SERVER]
-        write_manifest({"version": version, "complete": True, "files": files})
-    finally:
-        UPLOAD.unlink(missing_ok=True)
+    bin_dir = (HOME / SERVER).parent
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".gliff-upload-", dir=bin_dir) as work:
+        upload = pathlib.Path(work) / "gliff-server"
+        with upload.open("wb") as stream:
+            remaining = size
+            while remaining:
+                chunk = sys.stdin.buffer.read(min(remaining, 1 << 20))
+                if not chunk:
+                    raise Refused("upload", "The upload did not finish")
+                stream.write(chunk)
+                remaining -= len(chunk)
+            if sys.stdin.buffer.read(1):
+                raise Refused("upload", "The upload exceeded its expected size")
+        version = check_upload(upload, size)
+        with install_lock() as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            adopt_verified(upload, version)
+    target = HOME / SERVER
     reply(ok=True, status="installed", version=version, path=str(target), on_path=on_path(target))
+
+
+def install_lock():
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    return MANIFEST.with_suffix(".lock").open("a")
+
+
+def adopt_verified(upload, version):
+    manifest = read_manifest()
+    target = HOME / SERVER
+    if os.path.lexists(target):
+        meta = target.lstat()
+        ours = (stat.S_ISREG(meta.st_mode) and meta.st_uid == os.getuid()
+                and digest(target) in owned_hashes(manifest, SERVER))
+        if not ours:
+            raise Refused("conflict", f"~/{SERVER} already exists and was not installed by gliff")
+    data = upload.read_bytes()
+    files = dict(manifest.get("files", {}))
+    pending = {SERVER: hashlib.sha256(data).hexdigest()}
+    write_manifest({"version": version, "complete": False, "files": files, "pending": pending})
+    write_atomic(target, data, 0o755)
+    files[SERVER] = pending[SERVER]
+    write_manifest({"version": version, "complete": True, "files": files})
+
+
+def interrupted_upload(_signal, _frame):
+    raise Refused("upload", "The upload was interrupted")
 
 
 def main():
     if len(sys.argv) > 1:
-        return adopt(int(sys.argv[1]))
+        size = int(sys.argv[1])
+        if size <= 0:
+            raise Refused("upload", "The upload size is invalid")
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            signal.signal(sig, interrupted_upload)
+        return adopt(size)
     found = shutil.which("gliff-server")
     if found and not unfinished(read_manifest()):
         return reply(ok=True, status="present", path=found)
@@ -308,7 +339,9 @@ def main():
         missing = missing_libraries(staged / b for b in BINARIES)
         if missing:
             raise Refused("libraries", "Missing libraries on that machine: " + ", ".join(missing))
-        install(staged, version)
+        with install_lock() as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            install(staged, version)
     reply(ok=True, status="installed", version=version, path=str(HOME / SERVER), on_path=on_path(HOME / SERVER))
 
 

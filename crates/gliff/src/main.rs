@@ -17,6 +17,7 @@ mod paintable;
 mod protocol_badge;
 mod recent;
 mod remote_install;
+mod rustdesk_displays;
 mod secrets;
 mod sound;
 mod theme;
@@ -76,6 +77,9 @@ struct Cli {
     /// Open the window fullscreen.
     #[arg(long)]
     fullscreen: bool,
+    /// Put a --stdio receiver on this local display connector (e.g. DP-1).
+    #[arg(long, requires = "stdio")]
+    fullscreen_output: Option<String>,
     /// Remote gliff-server path.
     #[arg(long, default_value = "gliff-server")]
     server_bin: String,
@@ -115,11 +119,15 @@ struct Cli {
 /// Everything the UI shares with its callbacks.
 struct App {
     window: adw::ApplicationWindow,
+    detached_display: Option<i32>,
+    screen_in_use: Rc<Cell<bool>>,
     /// The picture, upcast; input controllers attach to it and we measure it.
     video: gtk::Widget,
     /// What the picture shows: the latest frame fitted to the window.
     frame: paintable::FramePaintable,
     stats: gtk::Label,
+    rustdesk_display_button: gtk::MenuButton,
+    rustdesk_display_number: gtk::Label,
     /// Centred over the picture while the shown session is not streaming:
     /// connecting, reconnecting, an error, or no session at all.
     status: gtk::Label,
@@ -177,6 +185,7 @@ struct Session {
     name: String,
     endpoint: Endpoint,
     input_tx: RefCell<Option<OutSender>>,
+    rustdesk_displays: RefCell<rustdesk_displays::State>,
     /// Bumped by every `start_session` and by `stop_session`, so pollers and
     /// delayed reconnects of an earlier worker can tell they are stale.
     generation: Cell<u64>,
@@ -243,6 +252,7 @@ impl Session {
             name: machine_name(&endpoint).to_string(),
             endpoint,
             input_tx: RefCell::new(None),
+            rustdesk_displays: RefCell::new(Default::default()),
             generation: Cell::new(0),
             conn: Cell::new(0),
             retries: Cell::new(0),
@@ -314,7 +324,8 @@ fn main() -> glib::ExitCode {
         gtk::Window::set_default_icon_name(APP_NAME);
         *theme_monitor.borrow_mut() = theme::follow_omarchy_theme();
     });
-    app.connect_activate(move |app| build_ui(app, &cli));
+    let screen_in_use = Rc::new(Cell::new(false));
+    app.connect_activate(move |app| build_ui(app, &cli, None, screen_in_use.clone()));
     // GTK owns argv parsing; we already parsed with clap, so pass none.
     let empty: Vec<String> = vec![];
     let code = app.run_with_args(&empty);
@@ -433,7 +444,31 @@ fn window_title(endpoint: &Endpoint) -> String {
 
 /// The one window: a header with a tab per machine and the address bar, the
 /// remote screen (black until connected) with any status over it.
-fn build_ui(app: &adw::Application, cli: &Cli) {
+fn build_ui(
+    app: &adw::Application,
+    cli: &Cli,
+    detached: Option<(Rc<Session>, i32)>,
+    screen_in_use: Rc<Cell<bool>>,
+) {
+    let fullscreen_monitor = if let Some(output) = &cli.fullscreen_output {
+        let monitor = gdk::Display::default().and_then(|display| {
+            display
+                .monitors()
+                .iter::<gdk::Monitor>()
+                .filter_map(Result::ok)
+                .find(|monitor| monitor.connector().as_deref() == Some(output.as_str()))
+        });
+        let Some(monitor) = monitor else {
+            eprintln!("gliff: no display connector named {output:?} on this machine");
+            STDIO_FAILED.store(true, Ordering::Relaxed);
+            app.quit();
+            return;
+        };
+        Some(monitor)
+    } else {
+        None
+    };
+    let detached_display = detached.as_ref().map(|(_, display)| *display);
     let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("Gliff")
@@ -445,7 +480,11 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         .show_title(false)
         // No window buttons: closing is the compositor's job, and a stray
         // click on an X in the middle of a remote session is a bad surprise.
-        .decoration_layout("")
+        .decoration_layout(if detached_display.is_some() {
+            ":close"
+        } else {
+            ""
+        })
         .build();
     let entry = gtk::Entry::builder()
         .placeholder_text("user@host")
@@ -488,6 +527,21 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     header.pack_start(&add_revealer);
     header.pack_end(&fullscreen_btn);
     header.pack_end(&stats_btn);
+    let rustdesk_display_label = gtk::Box::new(gtk::Orientation::Horizontal, 3);
+    rustdesk_display_label.append(&gtk::Image::from_icon_name(
+        "video-joined-displays-symbolic",
+    ));
+    let rustdesk_display_number = gtk::Label::new(None);
+    rustdesk_display_number.add_css_class("remote-display-badge");
+    rustdesk_display_number.set_valign(gtk::Align::Center);
+    rustdesk_display_number.set_visible(false);
+    rustdesk_display_label.append(&rustdesk_display_number);
+    let rustdesk_display_button = gtk::MenuButton::builder()
+        .child(&rustdesk_display_label)
+        .tooltip_text("Choose RustDesk monitor")
+        .visible(false)
+        .build();
+    header.pack_end(&rustdesk_display_button);
     let monitor_btn = gtk::Button::builder()
         .icon_name("video-display-symbolic")
         .build();
@@ -510,10 +564,14 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
     // A --stdio window is itself the other machine's screen.
     if !cli.stdio {
         header.pack_end(&monitor_btn);
-        header.pack_end(&sound_btn);
-        header.pack_end(&control_btn);
+        if detached_display.is_none() {
+            header.pack_end(&sound_btn);
+            header.pack_end(&control_btn);
+        }
         header.pack_end(&monitor_settings_btn);
-        header.pack_end(&hide_btn);
+        if detached_display.is_none() {
+            header.pack_end(&hide_btn);
+        }
     }
 
     let stats = gtk::Label::builder()
@@ -579,9 +637,13 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
 
     let ui = Rc::new(App {
         window: window.clone(),
+        detached_display,
+        screen_in_use,
         video: video.clone(),
         frame,
         stats: stats.clone(),
+        rustdesk_display_button,
+        rustdesk_display_number,
         status: status.clone(),
         hint,
         hint_generation: Cell::new(0),
@@ -611,22 +673,31 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         ReleaseHotkey::None
     });
     install_input_handlers(&ui, &video, &window, hotkey);
-    install_resize_handler(&ui);
-    install_address_bar(&ui, &connect_btn);
-    *ui.monitor.borrow_mut() = Some(monitor::Controller::install(
-        &ui,
-        &monitor_btn,
-        &monitor_settings_btn,
-        &control_btn,
-        &hide_btn,
-        &sound_btn,
-    ));
+    let resize_timer = RefCell::new(Some(install_resize_handler(&ui)));
+    if detached_display.is_none() {
+        install_address_bar(&ui, &connect_btn);
+    }
+    if !ui.cli.stdio {
+        *ui.monitor.borrow_mut() = Some(monitor::Controller::install(
+            &ui,
+            &monitor_btn,
+            &monitor_settings_btn,
+            &control_btn,
+            &hide_btn,
+            &sound_btn,
+        ));
+    }
     refresh_tabs(&ui);
 
     // Fullscreen toggle.
     {
         let window = window.clone();
         fullscreen_btn.connect_toggled(move |b| {
+            // The window also syncs this button when its state changes.
+            // Reissuing fullscreen there would discard the requested monitor.
+            if b.is_active() == window.is_fullscreen() {
+                return;
+            }
             if b.is_active() {
                 window.fullscreen();
             } else {
@@ -654,13 +725,55 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         ".machine-tab > button.tab-action:hover { color: currentColor; }",
         ".status-dot { min-width: 6px; min-height: 6px; border-radius: 50%; border: 1.5px solid alpha(currentColor, 0.6); }",
         ".status-dot.connected { background: var(--success-color); border-color: var(--success-color); }",
+        ".remote-display-badge { background: alpha(currentColor, 0.16); border-radius: 999px; font-size: 0.8em; font-weight: bold; min-width: 1em; padding: 0 3px; }",
     ));
-    if let Some(display) = gdk::Display::default() {
+    if let Some(display) = gdk::Display::default().filter(|_| detached_display.is_none()) {
         gtk::style_context_add_provider_for_display(
             &display,
             &css,
             gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
         );
+    }
+
+    // Another window can keep the application running after this one closes.
+    // Shut down this window's workers without forgetting its usual tabs.
+    let weak_ui = Rc::downgrade(&ui);
+    window.connect_close_request(move |_| {
+        if let Some(timer) = resize_timer.borrow_mut().take() {
+            timer.remove();
+        }
+        if let Some(ui) = weak_ui.upgrade() {
+            release_pressed_keys(&ui);
+            for session in ui.sessions.borrow_mut().drain(..) {
+                session.generation.set(session.generation.get() + 1);
+                session.input_tx.borrow_mut().take();
+                session.last_frame.borrow_mut().take();
+                session.credentials.borrow_mut().take();
+            }
+            ui.active.borrow_mut().take();
+            ui.frame.clear();
+            if ui.detached_display.is_some() {
+                while let Some(tab) = ui.tabs.first_child() {
+                    ui.tabs.remove(&tab);
+                }
+                let controllers = ui.video.observe_controllers();
+                while let Some(controller) =
+                    controllers.item(0).and_downcast::<gtk::EventController>()
+                {
+                    ui.video.remove_controller(&controller);
+                }
+            }
+        }
+        glib::Propagation::Proceed
+    });
+
+    if let Some((session, _)) = detached {
+        show_address_bar(&ui, false);
+        ui.sessions.borrow_mut().push(session.clone());
+        start_session(ui.clone(), session.clone());
+        show_session(&ui, &session);
+        window.present();
+        return;
     }
 
     // Offer every local clipboard change to the shown server; our own proxy
@@ -691,7 +804,9 @@ fn build_ui(app: &adw::Application, cli: &Cli) {
         *ui.local_clipboard.borrow_mut() = watch;
     }
 
-    if cli.fullscreen {
+    if let Some(monitor) = fullscreen_monitor {
+        window.fullscreen_on_monitor(&monitor);
+    } else if cli.fullscreen {
         window.fullscreen();
     }
     window.present();
@@ -792,9 +907,10 @@ fn install_address_bar(ui: &Rc<App>, connect_btn: &gtk::Button) {
 /// neither: it closes with its one stream, and would take any other
 /// machine opened in it along.
 fn show_address_bar(ui: &App, show: bool) {
-    let show = !ui.cli.stdio && (show || ui.tabs.first_child().is_none());
+    let can_add = !ui.cli.stdio && ui.detached_display.is_none();
+    let show = can_add && (show || ui.tabs.first_child().is_none());
     ui.add_revealer.set_reveal_child(show);
-    ui.add_btn.set_visible(!show && !ui.cli.stdio);
+    ui.add_btn.set_visible(!show && can_add);
     // A folded address bar must not keep the focus GTK gave it when the
     // window opened, or hovering the picture would never capture.
     if !show && address_bar_in_use(&ui.window, &ui.entry) {
@@ -805,7 +921,7 @@ fn show_address_bar(ui: &App, show: bool) {
 /// Connect to the machine in the address bar, or switch to its tab when it
 /// is already connected.
 fn connect_from_address_bar(ui: &Rc<App>) {
-    if ui.entry.text().trim().is_empty() || ui.cli.stdio {
+    if ui.entry.text().trim().is_empty() || ui.cli.stdio || ui.detached_display.is_some() {
         return;
     }
     let machine = ui.protocol.address();
@@ -969,7 +1085,7 @@ fn find_session(ui: &App, name: &str) -> Option<Rc<Session>> {
 /// not remembered yet (a first connect still in progress, or a dev
 /// `--connect`).
 fn tab_names(ui: &App) -> Vec<String> {
-    let mut names = if ui.cli.stdio {
+    let mut names = if ui.cli.stdio || ui.detached_display.is_some() {
         Vec::new()
     } else {
         Config::load(&ui.config_path).machines
@@ -1014,8 +1130,12 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
     let running = session.is_some() || screen_in_use || driven;
     // The name is a plain label and the whole tab takes the click, so no
     // part of a tab takes keyboard focus and grows a focus ring.
+    let tab_title = ui.detached_display.map_or_else(
+        || name.to_string(),
+        |index| format!("{name} · Monitor {}", i64::from(index) + 1),
+    );
     let label = gtk::Label::builder()
-        .label(name)
+        .label(&tab_title)
         .css_classes(["tab-label"])
         .build();
     if !running {
@@ -1130,6 +1250,10 @@ fn machine_tab(ui: &Rc<App>, name: &str) -> gtk::Box {
         });
     }
 
+    if ui.detached_display.is_some() {
+        return tab;
+    }
+
     // Drag to reorder. The source runs in the capture phase so a drag
     // starting on the name wins over the button's click and the header's
     // window move.
@@ -1173,6 +1297,9 @@ fn select_tab(ui: &Rc<App>, name: &str) {
     // A machine lending its screen is not also shown here unless asked
     // for: connecting to it would show this screen inside itself.
     let lending = ui.monitor.borrow().as_ref().is_some_and(|m| m.owns(name));
+    if lending && ui.detached_display.is_some() {
+        return;
+    }
     if lending && find_session(ui, name).is_none() {
         show_lending(ui, name);
         return;
@@ -1234,6 +1361,33 @@ fn open_session(ui: &Rc<App>, endpoint: Endpoint) {
     show_session(ui, &s);
 }
 
+/// Open a second connection to the same machine while the source tab keeps streaming.
+fn open_rustdesk_display_window(ui: &Rc<App>, source: &Session, display: i32) {
+    let Some(app) = ui.window.application().and_downcast::<adw::Application>() else {
+        return;
+    };
+    let Some(credentials) = source.credentials.borrow().clone() else {
+        return;
+    };
+    release_pressed_keys(ui);
+    let session = Rc::new(Session::new(source.endpoint.clone()));
+    *session.credentials.borrow_mut() = Some(credentials);
+    build_ui(
+        &app,
+        &ui.cli,
+        Some((session, display)),
+        ui.screen_in_use.clone(),
+    );
+}
+
+fn pause_detached_view(ui: &Rc<App>, session: &Session) {
+    show_nothing(ui);
+    session.generation.set(session.generation.get() + 1);
+    session.input_tx.borrow_mut().take();
+    session.last_frame.borrow_mut().take();
+    session.connected.set(false);
+}
+
 /// Make `s` the session the window shows and sends input to.
 fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
     if let Some(m) = ui.monitor.borrow().as_ref() {
@@ -1247,11 +1401,16 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
             ui.cli.no_clipboard,
             ui.local_clipboard.borrow().as_ref(),
         );
-        if s.endpoint.is_listed() {
+        if s.endpoint.is_listed() && ui.detached_display.is_none() {
             update_config(ui, |c| c.shown = Some(s.name.clone()));
         }
     }
-    ui.window.set_title(Some(&window_title(&s.endpoint)));
+    let title = window_title(&s.endpoint);
+    let title = match ui.detached_display {
+        Some(index) => format!("{title} · Monitor {}", i64::from(index) + 1),
+        None => title,
+    };
+    ui.window.set_title(Some(&title));
     show_status(ui, &s.status.borrow());
     ui.stats.set_text(&s.stats.borrow());
     match &*s.last_frame.borrow() {
@@ -1263,6 +1422,7 @@ fn show_session(ui: &Rc<App>, s: &Rc<Session>) {
     // shown.
     request_resize(ui);
     request_zoom(ui);
+    rustdesk_displays::refresh(ui);
     refresh_tabs(ui);
 }
 
@@ -1276,17 +1436,21 @@ fn show_nothing(ui: &Rc<App>) {
     ui.stats.set_text("");
     ui.frame.clear();
     ui.video.set_cursor(None);
+    rustdesk_displays::refresh(ui);
     refresh_tabs(ui);
 }
 
 /// End a machine's session. When it was the one shown, the window moves to
 /// the nearest running tab, to the right first.
 fn stop_session(ui: &Rc<App>, name: &str) {
+    if let Some(controller) = ui.monitor.borrow().as_ref() {
+        controller.cancel_check(name);
+    }
     let Some(s) = find_session(ui, name) else {
         return;
     };
     // A --stdio window exists for its one session.
-    if matches!(s.endpoint, Endpoint::Stdio(_)) {
+    if matches!(s.endpoint, Endpoint::Stdio(_)) || ui.detached_display.is_some() {
         ui.window.close();
         return;
     }
@@ -1323,6 +1487,9 @@ fn stop_session(ui: &Rc<App>, name: &str) {
 
 /// Drop a machine that is not running from the remembered list.
 fn forget_machine(ui: &Rc<App>, name: &str) {
+    if let Some(controller) = ui.monitor.borrow().as_ref() {
+        controller.cancel_check(name);
+    }
     update_config(ui, |c| c.forget(name));
     if gliff_foreign::Target::parse(name).is_some() {
         foreign_ui::forget(name);
@@ -1384,6 +1551,10 @@ fn set_stats(ui: &App, s: &Rc<Session>, text: &str) {
 
 /// Go back to a black screen with no stream geometry.
 fn show_disconnected(ui: &Rc<App>, s: &Rc<Session>) {
+    *s.rustdesk_displays.borrow_mut() = Default::default();
+    if is_active(ui, s) {
+        rustdesk_displays::refresh(ui);
+    }
     if s.connected.replace(false) {
         refresh_tabs(ui);
     }
@@ -1425,6 +1596,10 @@ fn start_session(ui: Rc<App>, s: Rc<Session>) {
     let (frame_tx, frame_rx) = sync_channel::<Picture>(2);
     let (status_tx, status_rx) = channel::<Status>();
     let (input_tx, input_rx) = unbounded_channel::<clipboard::ToWorker>();
+    if let Some(index) = ui.detached_display {
+        s.rustdesk_displays.borrow_mut().expect_display(index);
+        let _ = input_tx.send(clipboard::ToWorker::SelectRustDeskDisplay(index));
+    }
     // Replacing the sender closes the old worker's input, which ends it.
     *s.input_tx.borrow_mut() = Some(input_tx);
     s.zoom.set(1);
@@ -1470,7 +1645,7 @@ const MAX_RETRIES: u32 = 5;
 /// reconnect when the window opens again, once per session. The connected
 /// status repeats on every stream reconfigure, such as a resize.
 fn remember_machine(ui: &Rc<App>, s: &Session) {
-    if !s.endpoint.is_listed() || s.remembered.replace(true) {
+    if ui.detached_display.is_some() || !s.endpoint.is_listed() || s.remembered.replace(true) {
         return;
     }
     update_config(ui, |c| {
@@ -1704,6 +1879,13 @@ fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u
             }
         }
         if let Some(p) = latest {
+            if ui
+                .detached_display
+                .is_some_and(|index| p.rustdesk_display != Some(index))
+                || !s.rustdesk_displays.borrow().accepts(p.rustdesk_display)
+            {
+                return glib::ControlFlow::Continue;
+            }
             match frame_texture(p.frame) {
                 Ok(texture) => {
                     // Geometry follows the frame that really paints, so the
@@ -1717,6 +1899,12 @@ fn poll_frames(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Picture>, generation: u
                             .set_frame(texture.clone(), device_scale(&ui), p.view);
                     }
                     *s.last_frame.borrow_mut() = Some((texture, p.view));
+                    if s.rustdesk_displays.borrow_mut().painted(p.rustdesk_display) {
+                        set_status(&ui, &s, "");
+                        if is_active(&ui, &s) {
+                            rustdesk_displays::refresh(&ui);
+                        }
+                    }
                 }
                 Err(e) => tracing::warn!(error = %e, "frame texture import failed"),
             }
@@ -1777,6 +1965,21 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
         }
         while let Ok(status) = rx.try_recv() {
             match status {
+                Status::RustDeskDisplays {
+                    displays,
+                    active,
+                    switch_failed,
+                } => {
+                    s.rustdesk_displays
+                        .borrow_mut()
+                        .update(displays, active, switch_failed);
+                    if switch_failed {
+                        set_status(&ui, &s, "RustDesk no longer offers that monitor");
+                    }
+                    if is_active(&ui, &s) {
+                        rustdesk_displays::refresh(&ui);
+                    }
+                }
                 // Pointer-mapping geometry (stream_size/view/scale) is not
                 // read from the config: it follows each decoded frame, so a
                 // new config never remaps clicks against the old picture.
@@ -1803,7 +2006,9 @@ fn poll_status(ui: Rc<App>, s: Rc<Session>, rx: Receiver<Status>, generation: u6
                     if !s.connected.replace(true) {
                         refresh_tabs(&ui);
                     }
-                    set_status(&ui, &s, "");
+                    if !s.rustdesk_displays.borrow().switching() {
+                        set_status(&ui, &s, "");
+                    }
                     // Visible before the first per-second stats arrive.
                     set_stats(&ui, &s, &video);
                     remember_machine(&ui, &s);
@@ -2062,6 +2267,17 @@ fn send(ui: &App, msg: ClientMsg) {
 }
 
 fn send_to(s: &Session, msg: ClientMsg) {
+    if s.rustdesk_displays.borrow().blocks_input()
+        && matches!(
+            msg,
+            ClientMsg::PointerMotion { .. }
+                | ClientMsg::PointerAxis { .. }
+                | ClientMsg::PointerButton { pressed: true, .. }
+                | ClientMsg::Key { pressed: true, .. }
+        )
+    {
+        return;
+    }
     if let Some(tx) = s.input_tx.borrow().as_ref() {
         let _ = tx.send(clipboard::ToWorker::Send(msg));
     }
@@ -2428,6 +2644,19 @@ fn install_input_handlers(
             if pressed {
                 ui.released.set(false);
                 video.grab_focus();
+                // A new monitor may have painted under a stationary pointer.
+                // Send its actual click position before the button down.
+                if active(&ui).is_some_and(|s| s.rustdesk_displays.borrow().has_display()) {
+                    if let Some((x, y)) = event.position() {
+                        if let Some(point) = ui
+                            .window
+                            .compute_point(&video, &gtk::graphene::Point::new(x as f32, y as f32))
+                        {
+                            let (x, y) = to_remote(&ui, f64::from(point.x()), f64::from(point.y()));
+                            send(&ui, ClientMsg::PointerMotion { x, y });
+                        }
+                    }
+                }
             }
             send(&ui, ClientMsg::PointerButton { button, pressed });
             glib::Propagation::Proceed
@@ -2631,7 +2860,7 @@ fn install_fullscreen_bars(
 /// no settling delay: on the GPU tier the change costs only a reallocation
 /// of the display images and a redraw, and the CPU tier picks it up with
 /// its next frame.
-fn install_resize_handler(ui: &Rc<App>) {
+fn install_resize_handler(ui: &Rc<App>) -> glib::SourceId {
     // A Picture has no resize signal, so poll its allocation; the one-shot
     // timer sends only once the size has held for 200 ms.
     let ui = ui.clone();
@@ -2658,7 +2887,7 @@ fn install_resize_handler(ui: &Rc<App>) {
             });
         }
         glib::ControlFlow::Continue
-    });
+    })
 }
 
 /// Ask the decoder for the integer zoom the current window allows, when it

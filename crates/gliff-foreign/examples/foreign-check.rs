@@ -73,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
             c.width, c.height, c.hot_x, c.hot_y
         ),
         Event::CursorHidden => println!("cursor hidden"),
+        Event::RustDeskDisplays { .. } => {}
         Event::NewCertificate(fp) => println!("new certificate {fp}"),
     };
     let session = gliff_foreign::run(

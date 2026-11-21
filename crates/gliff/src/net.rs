@@ -50,6 +50,7 @@ const MAX_CURSOR: u32 = 1024;
 /// never paints a frame with another configuration's view or scale (frames
 /// and statuses travel on separate channels).
 pub struct Picture {
+    pub rustdesk_display: Option<i32>,
     pub frame: Frame,
     /// Stream size in physical pixels.
     pub stream: (u32, u32),
@@ -63,6 +64,11 @@ pub struct Picture {
 /// is deliberately absent: it travels with each `Picture`, so the UI never
 /// maps clicks against a configuration whose frame is not on screen yet.
 pub enum Status {
+    RustDeskDisplays {
+        displays: Vec<gliff_foreign::RemoteDisplay>,
+        active: i32,
+        switch_failed: bool,
+    },
     Connected {
         /// "server tier→client tier", e.g. "GPU→CPU".
         video: String,
@@ -499,11 +505,13 @@ async fn foreign_session(
     mut input: UnboundedReceiver<ToWorker>,
 ) -> Result<(), gliff_foreign::Error> {
     use gliff_foreign::{Event, Purpose};
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
+    use std::sync::mpsc::TrySendError;
     use std::time::{Duration, Instant};
 
     let zoom = Rc::new(Cell::new(1u32));
     let (tx, mut rx) = unbounded_channel::<ClientMsg>();
+    let (display_tx, mut display_rx) = unbounded_channel();
     let forward = {
         let zoom = zoom.clone();
         async move {
@@ -513,6 +521,9 @@ async fn foreign_session(
                         let _ = tx.send(m);
                     }
                     ToWorker::Zoom(z) => zoom.set(z),
+                    ToWorker::SelectRustDeskDisplay(index) => {
+                        let _ = display_tx.send(index);
+                    }
                     // The clipboard is not shared with these machines.
                     _ => {}
                 }
@@ -524,7 +535,32 @@ async fn foreign_session(
     let cursor = LatestCursor::default();
     let mut video = String::from("RDP");
     let mut counted = (Instant::now(), 0u32);
+    let mut active_display = None;
+    let pending_picture = RefCell::new(None);
+    let frame_waiting = tokio::sync::Notify::new();
+    let send_picture = |picture| {
+        let deferred = match frames.try_send(picture) {
+            Err(TrySendError::Full(picture)) => Some(picture),
+            _ => None,
+        };
+        *pending_picture.borrow_mut() = deferred;
+        if pending_picture.borrow().is_some() {
+            frame_waiting.notify_one();
+        }
+    };
     let mut events = |e: Event| match e {
+        Event::RustDeskDisplays {
+            displays,
+            active,
+            switch_failed,
+        } => {
+            active_display = Some(active);
+            let _ = status.send(Status::RustDeskDisplays {
+                displays,
+                active,
+                switch_failed,
+            });
+        }
         Event::Connected {
             width,
             height,
@@ -559,8 +595,10 @@ async fn foreign_session(
                 pixels: bgrx,
             }
             .zoomed(clamp_zoom(zoom.get(), (width, height)), &pool);
-            // Latest wins: a full channel drops this picture, not the UI.
-            let _ = frames.try_send(Picture {
+            // The first picture after a switch may be the only one the peer
+            // sends until its desktop changes. Keep it if the queue is full.
+            send_picture(Picture {
+                rustdesk_display: active_display,
                 frame: Frame::Bgra(frame),
                 stream: (width, height),
                 view: (width, height),
@@ -609,18 +647,52 @@ async fn foreign_session(
         width: login.size.0,
         height: login.size.1,
     };
-    let run = gliff_foreign::run(
-        &target,
-        &login.credentials,
-        purpose,
-        login.known_certificate.as_deref(),
-        &mut rx,
-        &mut events,
-    );
-    tokio::pin!(run);
+    let run = async {
+        if target.kind == gliff_foreign::Kind::RustDesk {
+            gliff_foreign::view_rustdesk(
+                &target,
+                &login.credentials,
+                purpose,
+                &mut rx,
+                &mut display_rx,
+                &mut events,
+            )
+            .await
+        } else {
+            gliff_foreign::run(
+                &target,
+                &login.credentials,
+                purpose,
+                login.known_certificate.as_deref(),
+                &mut rx,
+                &mut events,
+            )
+            .await
+        }
+    };
+    let flush_frames = async {
+        loop {
+            frame_waiting.notified().await;
+            while pending_picture.borrow().is_some() {
+                tokio::time::sleep(Duration::from_millis(8)).await;
+                let picture = pending_picture.borrow_mut().take();
+                if let Some(picture) = picture {
+                    *pending_picture.borrow_mut() = match frames.try_send(picture) {
+                        Err(TrySendError::Full(picture)) => Some(picture),
+                        _ => None,
+                    };
+                }
+            }
+        }
+    };
+    tokio::pin!(run, flush_frames);
     tokio::select! {
         ended = &mut run => ended,
-        () = forward => run.await,
+        () = forward => tokio::select! {
+            ended = &mut run => ended,
+            () = &mut flush_frames => unreachable!("frame delivery runs until the session ends"),
+        },
+        () = &mut flush_frames => unreachable!("frame delivery runs until the session ends"),
     }
 }
 
@@ -940,6 +1012,7 @@ where
                     let (stream, view, scale_milli) =
                         last_gpu_geometry.unwrap_or(cfg.geometry());
                     let picture = Picture {
+                        rustdesk_display: None,
                         frame,
                         stream,
                         view,
@@ -974,6 +1047,7 @@ where
                                     .pop_front()
                                     .unwrap_or(cfg.geometry());
                                 Picture {
+                                    rustdesk_display: None,
                                     frame: Frame::Bgra(zoom.cpu_frame(f, &pool)),
                                     stream,
                                     view,
@@ -1067,6 +1141,7 @@ where
                             last_gpu_geometry = Some((stream, pic_view, pic_scale));
                         }
                         let picture = Picture {
+                            rustdesk_display: None,
                             frame,
                             stream,
                             view: pic_view,
