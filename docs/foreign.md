@@ -17,9 +17,10 @@ gliff rdp://ann@office-pc
 gliff --control right:rustdesk://laptop
 ```
 
-A tab shows the machine's screen; the mouse button in the header drives it
-from the edge of this computer's screens you pick, with no window. Sound,
-the clipboard and "Use as a screen" need gliff on the other machine.
+A tab shows the machine's screen. The mouse button in the header lets you
+drive it from the edge of this computer's screens. RustDesk tabs can play
+audio. The clipboard and "Use as a screen" require Gliff on the remote
+machine.
 
 ## Logging in
 
